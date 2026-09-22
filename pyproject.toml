@@ -1,0 +1,35 @@
+[project]
+name = "rfs-v3-scripts"
+version = "0.1.0"
+description = "Scripts that build the RFS v3 retrospective simulation products"
+requires-python = ">=3.14"
+dependencies = [
+    "numba>=0.67",
+    "numcodecs>=0.16",
+    "numpy==2.5.3",
+    "pandas>=3.0.5,<4",
+    "pyarrow>=25.0.1",
+    "river-route",
+    "xarray==2026.7.0",
+    "zarr>=3.3,<4",
+]
+
+[tool.uv.sources]
+river-route = { path = "../river-route", editable = true }
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.format]
+skip-magic-trailing-comma = true
+quote-style = "single"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "NPY", "SIM"]
+
+[tool.ruff.lint.isort]
+split-on-trailing-comma = false
+known-first-party = ["rfs_aggregate", "rfs_spec"]
