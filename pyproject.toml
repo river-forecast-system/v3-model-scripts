@@ -1,7 +1,7 @@
 [project]
 name = "rfs-v3-scripts"
 version = "0.1.0"
-description = "Scripts that build the RFS v3 retrospective simulation products"
+description = "Scripts that build the RFS v3 products"
 requires-python = ">=3.14"
 dependencies = [
     "numba>=0.67",
@@ -32,4 +32,4 @@ select = ["E", "F", "I", "UP", "B", "NPY", "SIM"]
 
 [tool.ruff.lint.isort]
 split-on-trailing-comma = false
-known-first-party = ["rfs_aggregate", "rfs_spec"]
+known-first-party = ["spec"]
