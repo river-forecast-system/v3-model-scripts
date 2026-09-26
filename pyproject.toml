@@ -4,12 +4,16 @@ version = "0.1.0"
 description = "Scripts that build the RFS v3 products"
 requires-python = ">=3.14"
 dependencies = [
+    "boto3>=1.43.103",
+    "geopandas>=1.1",
     "numba>=0.67",
     "numcodecs>=0.16",
     "numpy==2.5.3",
     "pandas>=3.0.5,<4",
     "pyarrow>=25.0.1",
+    "pyproj>=3.8",
     "river-route",
+    "shapely>=2.1",
     "xarray==2026.7.0",
     "zarr>=3.3,<4",
 ]

@@ -5,6 +5,11 @@ Schematics"): encodings, chunking, time axes, and writing a block of rivers into
 Every discharge array is (riverId, time) float32, one river per chunk, 250 rivers per shard, and its time axis is cut
 at CHUNK_SPLIT_DATE so the historical record is one immutable chunk and an append only rewrites the chunk after it.
 Nothing else in this folder picks a dtype, codec, chunk shape or keepbits value.
+
+A store is written one calendar year at a time, each year its own zarr at ``store_path``, holding every river in
+riverIndex order. A year is therefore whole in the river dimension the moment its regions are written, and the
+published record is those years merged along time, which no longer has to happen while the simulation runs. For a
+one-year store the CHUNK_SPLIT_DATE cut never lands inside the time axis, so a chunk is one river's whole year.
 """
 
 import fcntl
@@ -42,14 +47,17 @@ _HALF = np.uint32((1 << (22 - KEEP_BITS)) - 1)
 _MASK = np.uint32(~((1 << (23 - KEEP_BITS)) - 1) & 0xFFFFFFFF)
 
 
-def global_layout(hydrography: Path, regions: list[str]) -> tuple[np.ndarray, dict[str, tuple[int, int]]]:
-    """Every riverId in riverIndex order, and each region's [start, end) rows of it."""
+def global_layout(
+    hydrography: Path, routing: Path, regions: list[str]
+) -> tuple[np.ndarray, dict[str, tuple[int, int]]]:
+    """Every riverId in riverIndex order, and each region's [start, end) rows of it, from the order of its
+    routing.parquet in ``routing``."""
     table = pq.read_table(hydrography / 'global' / 'metadata.parquet', columns=['riverId', 'riverIndex'])
     ids, index = table.column('riverId').to_numpy(), table.column('riverIndex').to_numpy()
     lookup = pd.Series(index, index=ids)
     offsets = {}
     for region in regions:
-        region_ids = pq.read_table(hydrography / f'region={region}' / 'routing.parquet', columns=['river_id'])
+        region_ids = pq.read_table(routing / f'region={region}' / 'routing.parquet', columns=['river_id'])
         rows = lookup.reindex(region_ids.column('river_id').to_numpy()).to_numpy()
         start = int(rows[0])
         if not np.array_equal(rows, np.arange(start, start + rows.size)):
@@ -75,18 +83,30 @@ def reduce_year(hourly: np.ndarray, year: int) -> dict[str, np.ndarray]:
     Round one calendar year of hourly discharge (river, hour) onto the keepbits grid in place, and reduce it to its
     daily, monthly and yearly means and the annual maxima of the hourly values and the daily means. Every mean is of
     the hours under it, summed in float64 and rounded onto the grid, so each maximum is a value its store holds.
+
+    The year may start late, as ERA5 does at 1940-01-01 07:00. ``hourly`` is then the year's last hours, each mean is
+    of the hours present under it, and a day with none is NaN.
     """
     month_days = pd.date_range(f'{year}-01-01', periods=12, freq='MS').days_in_month.to_numpy()
+    missing = 24 * int(month_days.sum()) - hourly.shape[1]
+    if missing < 0:
+        raise ValueError(f'{hourly.shape[1]} hours is more than the year {year} has')
     hourly = round_keepbits(hourly)
+    max_hourly = hourly.max(axis=1)
+    if missing:
+        hourly = np.concatenate((np.zeros((hourly.shape[0], missing), np.float32), hourly), axis=1)
+    day_hours = np.clip(24 * np.arange(1, month_days.sum() + 1) - missing, 0, 24)
+    month_starts = np.r_[0, np.cumsum(month_days)[:-1]]
     day_sums = hourly.reshape(hourly.shape[0], -1, 24).sum(axis=2, dtype=np.float64)
-    daily = round_keepbits((day_sums / 24).astype(np.float32))
-    monthly = np.add.reduceat(day_sums, np.r_[0, np.cumsum(month_days)[:-1]], axis=1) / (month_days * 24)
+    with np.errstate(invalid='ignore'):  # 0 / 0 for a day or month before the first hour
+        daily = round_keepbits((day_sums / day_hours).astype(np.float32))
+        monthly = np.add.reduceat(day_sums, month_starts, axis=1) / np.add.reduceat(day_hours, month_starts)
     return {
         'daily': daily,
         'monthly': round_keepbits(monthly.astype(np.float32)),
-        'yearly': round_keepbits((day_sums.sum(axis=1) / hourly.shape[1]).astype(np.float32)),
-        'max_hourly': hourly.max(axis=1),
-        'max_daily': daily.max(axis=1),
+        'yearly': round_keepbits((day_sums.sum(axis=1) / day_hours.sum()).astype(np.float32)),
+        'max_hourly': max_hourly,
+        'max_daily': daily[:, day_hours > 0].max(axis=1),
     }
 
 
@@ -96,14 +116,22 @@ def record_times(first_year: int, last_year: int) -> dict[str, pd.DatetimeIndex]
     return {name: pd.date_range(start, end, freq=freq, inclusive='left') for name, (freq, *_) in STORES.items()}
 
 
+def store_path(root: Path, name: str, year: int) -> Path:
+    """Where one year of one store lives: ``root/hourly/hourly_1980.zarr``, the years of a store side by side."""
+    return Path(root) / name / f'{name}_{year}.zarr'
+
+
 def create_store(path: Path, name: str, times: pd.DatetimeIndex, river_ids: np.ndarray) -> None:
     """Create one store, empty, with the spec's layout, encoding and metadata."""
     _, variables, aggregation, timesteps = STORES[name]
     n_rivers, n_time = len(river_ids), len(times)
     split = int(np.searchsorted(times, CHUNK_SPLIT_DATE))
     t_chunk = split if 0 < split < n_time else n_time
+    title = TITLE.format(name.capitalize())
+    if times[0].year == times[-1].year:
+        title = f'{title} {times[0].year}'
     group = zarr.create_group(str(path), overwrite=True,
-                              attributes={'title': TITLE.format(name.capitalize()), 'license': LICENSE})
+                              attributes={'title': title, 'license': LICENSE})
     attrs = {'long_name': 'Discharge at catchment outlet', 'standard_name': 'discharge', 'units': 'm3 s-1',
              'aggregation_method': aggregation, 'keepbits': KEEP_BITS}
     q = {'shape': (n_rivers, n_time), 'dtype': 'float32', 'fill_value': np.nan, 'compressors': [COMPRESSOR],
@@ -128,6 +156,7 @@ def create_store(path: Path, name: str, times: pd.DatetimeIndex, river_ids: np.n
 @contextmanager
 def shard_lock(locks: Path, shard: int):
     """flock one shard's lock file. It belongs to the open file, so it also excludes threads of the same process."""
+    Path(locks).mkdir(parents=True, exist_ok=True)
     with open(Path(locks) / f'{shard}.lock', 'a') as handle:
         fcntl.flock(handle, fcntl.LOCK_EX)
         try:
