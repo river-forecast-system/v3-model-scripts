@@ -8,8 +8,8 @@ whole-record stores, and upload them to S3 while they are written:
     <out-dir>/yearly.zarr      Q: the yearly means, and Q_timesteps
     <out-dir>/maximums.zarr    hourly and daily: each year's largest hourly value and largest daily mean
 
-laid out as spec.py says, one river's whole record per chunk and 250 rivers per shard, with the values of
-spec.reduce_year. 3_reduce_hourly.py is the simple version of this step, which writes only the reductions, one store
+laid out as rfs_spec.py says, one river's whole record per chunk and 250 rivers per shard, with the values of
+rfs_spec.reduce_year. 3_reduce_hourly.py is the simple version of this step, which writes only the reductions, one store
 per year. This one is built so that the ~15 TB of hourly record is read once and written once.
 
 An output shard is 250 rivers over every year, and an input chunk is 500 rivers of one year, so no shard can be
@@ -59,16 +59,16 @@ import zarr
 from tqdm import tqdm
 from zarr.core.buffer.cpu import NDBuffer
 
-import spec
+import rfs_spec
 
 warnings.filterwarnings('ignore', message='Consolidated metadata', category=UserWarning)
 
-SHARD = spec.RIVERS_PER_SHARD
+SHARD = rfs_spec.RIVERS_PER_SHARD
 # the smallest segment, 10,000 rivers: its cuts reread at most two of river-route's 500 river chunks
 MIN_SEGMENT_SHARDS = 40
 POLL_SECONDS = 5
 MULTIPART_BYTES = 64 * 2**20  # files larger than this are uploaded in parts of this size
-# each reduction by spec.reduce_year's name, and 'hourly' for the record: the store and variable it is written to
+# each reduction by rfs_spec.reduce_year's name, and 'hourly' for the record: the store and variable it is written to
 WRITTEN = {'hourly': ('hourly', 'Q'), 'daily': ('daily', 'Q'), 'monthly': ('monthly', 'Q'), 'yearly': ('yearly', 'Q'),
            'max_hourly': ('maximums', 'hourly'), 'max_daily': ('maximums', 'daily')}
 SHUFFLES = {'noshuffle': numcodecs.Blosc.NOSHUFFLE, 'shuffle': numcodecs.Blosc.SHUFFLE,
@@ -214,7 +214,7 @@ def build_segment(job: dict) -> None:
 
         def one(i: int) -> None:
             year, h0, h1, d0, d1 = columns[i]
-            values = spec.reduce_year(rows[:, h0:h1], year)
+            values = rfs_spec.reduce_year(rows[:, h0:h1], year)
             reduced['daily'][:, d0:d1] = values['daily']
             reduced['monthly'][:, 12 * i:12 * i + 12] = values['monthly']
             for name in ('yearly', 'max_hourly', 'max_daily'):
@@ -251,7 +251,7 @@ def build_segment(job: dict) -> None:
 
 def write_timesteps(out_dir: Path, work_dir: Path, threads: int) -> None:
     """Fill Q_timesteps from the monthly and yearly values kept in work_dir, TIMESTEPS_CHUNK[0] rivers at a time."""
-    width = spec.TIMESTEPS_CHUNK[0]
+    width = rfs_spec.TIMESTEPS_CHUNK[0]
     n_rivers = np.load(work_dir / f'{TIMESTEPS[0]}.npy', mmap_mode='r').shape[0]
 
     def put(name: str, r0: int) -> None:
@@ -277,10 +277,10 @@ def shard_files(arrays: dict, g0: int, g1: int) -> list[str]:
 def store_files(out_dir: Path, data: bool) -> list[str]:
     """The files of every store relative to out_dir: its data chunks, or everything else, which create_store writes.
     Chunks are under <variable>/c/, zarr v3's default chunk key encoding."""
-    chunk_dirs = tuple(f'{name}.zarr/{variable}/c/' for name, (_, variables, _, timesteps) in spec.STORES.items()
+    chunk_dirs = tuple(f'{name}.zarr/{variable}/c/' for name, (_, variables, _, timesteps) in rfs_spec.STORES.items()
                        for variable in (*variables, *(('Q_timesteps',) if timesteps else ())))
     files = []
-    for name in spec.STORES:
+    for name in rfs_spec.STORES:
         for directory, _, names in os.walk(out_dir / f'{name}.zarr'):
             rel = Path(directory).relative_to(out_dir).as_posix() + '/'
             if rel.startswith(chunk_dirs) == data:
@@ -350,7 +350,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--hydrography', type=Path, default=Path.home() / 'data' / 'rfsv3' / 'hydrography')
     parser.add_argument('--routing', type=Path, default=Path.home() / 'data' / 'rfsv3' / 'routing',
-                        help='where 1_prepare_hydrography.py wrote each region\'s routing files')
+                        help='where 1_prepare_inputs/ wrote each region\'s routing files')
     parser.add_argument('--discharge-root', type=Path, default=Path.home() / 'data' / 'rfsv3' / 'discharge',
                         help='where 2_route_regions.py wrote the hourly discharge')
     parser.add_argument('--out-dir', type=Path, default=Path.home() / 'data' / 'rfsv3' / 'retrospective')
@@ -373,7 +373,7 @@ if __name__ == '__main__':
 
     regions = sorted(d.name.split('=')[1] for d in args.routing.glob('region=*'))
     regions = [r for r in regions if r != 'global']  # region=global is every river as one network
-    river_ids, offsets = spec.global_layout(args.hydrography, args.routing, regions)
+    river_ids, offsets = rfs_spec.global_layout(args.hydrography, args.routing, regions)
     regions.sort(key=lambda r: offsets[r][0])  # riverIndex order, the order the segments stream in
 
     inputs = {r: {} for r in regions}  # region: {year: its discharge zarr}, for every year it has finished routing
@@ -403,7 +403,7 @@ if __name__ == '__main__':
         raise SystemExit('a region is chunked differently in different years')
     chunk_rows = {r: rows.pop() for r, rows in chunk_rows.items()}
 
-    times = spec.record_times(years[0], years[-1])
+    times = rfs_spec.record_times(years[0], years[-1])
     columns = []  # (year, its first hour read, its end hour, its first day, its end day), as columns of the stores
     for year in years:
         h0, h1 = times['hourly'].searchsorted([pd.Timestamp(f'{year}-01-01'), pd.Timestamp(f'{year + 1}-01-01')])
@@ -415,7 +415,7 @@ if __name__ == '__main__':
         blocks += [(region, l0, min(l0 + chunk_rows[region], end - start), start + l0)
                    for l0 in range(0, end - start, chunk_rows[region])]
 
-    stores = {name: args.out_dir / f'{name}.zarr' for name in spec.STORES}
+    stores = {name: args.out_dir / f'{name}.zarr' for name in rfs_spec.STORES}
     if args.overwrite:
         for directory in (work, *stores.values()):
             shutil.rmtree(directory, ignore_errors=True)
@@ -432,7 +432,7 @@ if __name__ == '__main__':
         (work / 'progress').mkdir(parents=True, exist_ok=True)
         segments = plan_segments(river_ids.size, args.processes)
         for name, path in stores.items():
-            spec.create_store(path, name, times[name], river_ids)
+            rfs_spec.create_store(path, name, times[name], river_ids)
         for name in TIMESTEPS:
             np.lib.format.open_memmap(work / f'{name}.npy', mode='w+', dtype=np.float32,
                                       shape=(river_ids.size, len(times[name])))
@@ -472,7 +472,7 @@ if __name__ == '__main__':
         if uploader.failed:
             raise SystemExit(f'could not upload the stores\' metadata to {args.s3_url}')
         sharded = {(name, variable): zarr.open_array(str(path / variable), mode='r')
-                   for name, path in stores.items() for variable in spec.STORES[name][1]}
+                   for name, path in stores.items() for variable in rfs_spec.STORES[name][1]}
         queued = {i: first for i, (first, _) in enumerate(segments)}  # rivers of each segment queued for upload
 
     def rivers_written() -> int:

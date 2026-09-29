@@ -18,6 +18,14 @@ dependencies = [
     "zarr>=3.3,<4",
 ]
 
+# installs rfs_spec.py, so every script folder imports it
+[build-system]
+requires = ["setuptools>=80"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["rfs_spec"]
+
 [tool.uv.sources]
 river-route = { path = "../river-route", editable = true }
 
@@ -36,4 +44,4 @@ select = ["E", "F", "I", "UP", "B", "NPY", "SIM"]
 
 [tool.ruff.lint.isort]
 split-on-trailing-comma = false
-known-first-party = ["spec"]
+known-first-party = ["rfs_spec", "regions"]

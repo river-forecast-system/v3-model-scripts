@@ -26,14 +26,14 @@ import pyarrow.parquet as pq
 import river_route as rr
 from tqdm import tqdm
 
-import spec
+import rfs_spec
 
 warnings.filterwarnings('ignore', message='Consolidated metadata', category=UserWarning)
 
 dt_routing = 3600
 network_conditioning = 'stabilized'
 # what river-route's zarr writer compresses with, set on import so every worker process sets it too
-rr.router.writers.ZARR_COMPRESSOR = spec.COMPRESSOR
+rr.router.writers.ZARR_COMPRESSOR = rfs_spec.COMPRESSOR
 
 
 def state_file(discharge_dir: Path, runoff_file: Path) -> Path:
@@ -49,7 +49,7 @@ def make_config(region_dir: Path, discharge_dir: Path, runoff_file: Path, init_s
         network_type=network_conditioning,
         # primary modeling choices
         coefficients='static',
-        forcing='runoff',
+        forcing='grid',
         transform='uniform',
         dt_routing=dt_routing,
         # model state files: start where the year before ended, and save where this one ends
@@ -58,7 +58,6 @@ def make_config(region_dir: Path, discharge_dir: Path, runoff_file: Path, init_s
         # where to place the results: discharge_<runoff file name>
         discharge_dir=discharge_dir,
         # the runoff forcing data and how to read it, one year at a time
-        runoff_type='gaussian_grid',
         runoff_files=[runoff_file],
         grid_weights_file=region_dir / f'gridweights_ERA5_{region}.nc',
         var_grid_runoff='ro',
@@ -98,7 +97,7 @@ if __name__ == '__main__':
     began = time.time()
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--routing', type=Path, default=Path.home() / 'data' / 'rfsv3' / 'routing',
-                        help='where 1_prepare_hydrography.py wrote each region\'s routing files')
+                        help='where 1_prepare_inputs/ wrote each region\'s routing files')
     parser.add_argument('--runoff-root', type=Path, default=Path.home() / 'data' / 'era5_zarr_16x16_12month')
     parser.add_argument('--discharge-root', type=Path, default=Path.home() / 'data' / 'rfsv3' / 'discharge')
     parser.add_argument('--processes', type=int, default=16, help='regions routed at once')

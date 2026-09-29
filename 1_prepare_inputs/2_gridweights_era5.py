@@ -1,8 +1,7 @@
 """
-Write the two files each region of the v3 hydrography needs before it can be routed on ERA5 into the routing
-directory, which mirrors the hydrography's region=<id> partition and is published beside it as routing/:
+Write the weights of each region of the v3 hydrography on the ERA5 grid into the routing directory, beside the
+routing.parquet 1_routing_files.py wrote there, which must exist first:
 
-    routing/region=<id>/routing.parquet             river_id, next_river_id, k, x: river-route's Muskingum network
     routing/region=<id>/gridweights_ERA5_<id>.nc    the ERA5 cells each catchment overlaps, and the share of it in each
 
 and an extra copy of the weights for jsrr, the browser router, which does not replace the netCDF, the weights' standard
@@ -10,16 +9,14 @@ format and the one the routing step reads:
 
     routing/region=<id>/gridweights_ERA5_<id>.parquet    the netCDF's weights, in the layout jsrr reads fastest
 
-The hydrography is only read, so the pipeline that builds it holds no routing configuration, except the Muskingum
-musk_k and musk_x it computes so they are attributes of the GIS files.
+and both for the whole world, every region's concatenated in riverIndex order as regions.py describes, beside the
+global routing.parquet of 1_routing_files.py:
 
-All list the region's rivers in riverIndex order. That order is topological, every river before the river it drains
-into, which river-route requires of the network. The weight table's rivers must follow it exactly, because nothing in
-the router matches them by id: lateral inflow column i is routed into river i. spec.global_layout also finds a
-region's rows of the published stores by that order.
+    routing/global/gridweights_ERA5_global.nc
+    routing/global/gridweights_ERA5_global.parquet
 
-The routing table is the region's metadata renamed: riverId, nextRiverId, musk_k and musk_x become river_id,
-next_river_id, k and x. Nothing is recomputed. Changing k or x is an option of the routing step.
+The weights list the region's rivers in the order of routing.parquet, riverIndex order, because nothing in the router
+matches them by id: lateral inflow column i is routed into river i.
 
 The weights are what river_route.runoff.grid_weights computes, built without its Voronoi diagram, which takes 34 s and
 6 GB to build for every region. On a rectilinear latitude-longitude grid the Voronoi cell of a grid point is the box
@@ -44,15 +41,14 @@ extra bytes cost more over the network than they save in parsing, and 1.26 MB an
 encoded. jsrr refuses a region unless every river in routing.parquet has a weight, which weight_table checks, and every
 weight names one of its rivers, which holds because the weights take their river ids from routing.parquet by position.
 
-Regions are independent and run in parallel, biggest first. A region whose three files exist is skipped unless
---overwrite is passed. Each file is written to a temporary name and renamed into place, so an interrupted run never
+Regions are independent and run in parallel, biggest first. A region whose two weight files exist is skipped unless
+--overwrite is passed. The global files are written once every region has its own, and rewritten when any region
+was. Each file is written to a temporary name and renamed into place, so an interrupted run never
 leaves a file that looks finished.
 """
 
 import argparse
-import os
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import geopandas as gpd
@@ -64,11 +60,11 @@ import pyproj
 import shapely
 import xarray as xr
 
+from regions import HYDROGRAPHY, ROUTING, catchments_file, list_regions, prepare_all, write_global, write_in_place
+
 MERCATOR_EPSG = 3857
 MERCATOR_MAX_LAT = 85.051_128_779_806_59  # where its square extent ends
 EQUAL_AREA = '+proj=cea +ellps=WGS84'
-# metadata column -> routing.parquet column
-ROUTING = {'riverId': 'river_id', 'nextRiverId': 'next_river_id', 'musk_k': 'k', 'musk_x': 'x'}
 WEIGHTS = ['river_id', 'x_index', 'y_index', 'x', 'y', 'area_sqm', 'proportion']
 # the weight columns jsrr reads, and their types
 JSRR_WEIGHTS = {'river_id': np.int32, 'x_index': np.int32, 'y_index': np.int32, 'area_sqm': np.float32,
@@ -105,31 +101,6 @@ def read_grid(path: Path) -> dict[str, np.ndarray]:
     mx, _ = to_mercator.transform(lon_edges, np.zeros_like(lon_edges))
     _, my = to_mercator.transform(np.zeros_like(lat_edges), lat_edges)
     return {'lon': lon, 'lat': lat, 'x_index': x_order, 'y_index': y_order, 'mx': np.asarray(mx), 'my': np.asarray(my)}
-
-
-def routing_table(metadata: pd.DataFrame, region: str) -> pd.DataFrame:
-    """The region's metadata as river-route's routing parameters, checked to be a closed, topologically sorted
-    network."""
-    metadata = metadata.sort_values('riverIndex', kind='stable')
-    index = metadata['riverIndex'].to_numpy()
-    if not np.array_equal(index, np.arange(index[0], index[0] + index.size)):
-        raise ValueError(f'{region}: riverIndex is not one contiguous run')
-    routing = pd.DataFrame({new: metadata[old].to_numpy() for old, new in ROUTING.items()}).astype(
-        {'river_id': np.int32, 'next_river_id': np.int32, 'k': np.float64, 'x': np.float64})
-
-    ids = pd.Index(routing['river_id'])
-    if ids.has_duplicates:
-        raise ValueError(f'{region}: river ids repeat')
-    downstream = ids.get_indexer(routing['next_river_id'])
-    flows_on = routing['next_river_id'].to_numpy() != -1
-    if np.any(downstream[flows_on] < 0):
-        raise ValueError(f'{region}: {int(np.sum(downstream[flows_on] < 0)):,} rivers drain out of the region')
-    if np.any(downstream[flows_on] <= np.flatnonzero(flows_on)):
-        raise ValueError(f'{region}: riverIndex is not topological, some river comes after the river it drains into')
-    k, x = routing['k'].to_numpy(), routing['x'].to_numpy()
-    if not np.all(np.isfinite(k) & (k > 0)) or not np.all((x >= 0) & (x <= 0.5)):
-        raise ValueError(f'{region}: k must be positive and x within [0, 0.5]')
-    return routing
 
 
 def cells_under(bounds: np.ndarray, grid: dict[str, np.ndarray]) -> gpd.GeoDataFrame:
@@ -180,14 +151,6 @@ def weight_table(table: pd.DataFrame, n_rivers: int, grid: dict[str, np.ndarray]
                          'area_sqm': np.float32, 'proportion': np.float32})
 
 
-def write_in_place(path: Path, write) -> None:
-    """Write to a temporary name beside ``path`` and rename it into place."""
-    partial = path.with_suffix('.partial' + path.suffix)
-    write(partial)
-    os.replace(partial, path)
-    return
-
-
 def write_jsrr_weights(weights: pd.DataFrame, path: Path) -> None:
     """Write the weights as parquet in the layout jsrr reads fastest: its columns only, snappy compressed, without
     dictionary encoding, in one row group, rows in the order given."""
@@ -197,24 +160,21 @@ def write_jsrr_weights(weights: pd.DataFrame, path: Path) -> None:
 
 
 def prepare_region(job: dict) -> str:
-    """Write one region's routing.parquet and weight tables."""
+    """Write one region's weight tables."""
     region, began = job['region'], time.time()
-    region_dir = job['hydrography'] / f'region={region}'
     routing_dir = job['routing'] / f'region={region}'
-    catchments_file = region_dir / f'catchments_{region}.geo.parquet'
-
-    metadata = pd.read_parquet(region_dir / f'metadata_{region}.parquet', columns=['riverIndex', *ROUTING])
-    routing = routing_table(metadata, region)
+    catchments_path = catchments_file(job['hydrography'], region)
+    routing = pd.read_parquet(routing_dir / 'routing.parquet', columns=['river_id'])
 
     # a batch at a time: decoding the whole file at once takes 15 GB for the largest region, a batch at a time 3 GB
     rivers, parts, seen = pd.Index(routing['river_id']), [], np.zeros(len(routing), dtype=np.int64)
-    for batch in pq.ParquetFile(catchments_file).iter_batches(CATCHMENT_BATCH, columns=['riverId', 'geometry']):
+    for batch in pq.ParquetFile(catchments_path).iter_batches(CATCHMENT_BATCH, columns=['riverId', 'geometry']):
         catchments = gpd.GeoDataFrame.from_arrow(pa.Table.from_batches([batch]))
         if catchments.crs is None or catchments.crs.to_epsg() != MERCATOR_EPSG:
             raise ValueError(f'{region}: expected catchments in EPSG:{MERCATOR_EPSG}, got {catchments.crs}')
         position = rivers.get_indexer(catchments['riverId'])
         if np.any(position < 0):
-            raise ValueError(f'{region}: a catchment has no river in the metadata')
+            raise ValueError(f'{region}: a catchment has no river in routing.parquet')
         seen[position] += 1
         bounds, grid = catchments.total_bounds, job['grid']
         if bounds[0] < grid['mx'][0] or bounds[2] > grid['mx'][-1] or bounds[1] < grid['my'][0] or \
@@ -224,7 +184,7 @@ def prepare_region(job: dict) -> str:
         part['river'] = position[part['river'].to_numpy()]
         parts.append(part)
     if np.any(seen != 1):
-        raise ValueError(f'{region}: the catchments are not one per river of the metadata')
+        raise ValueError(f'{region}: the catchments are not one per river of routing.parquet')
 
     try:
         weights = weight_table(pd.concat(parts, ignore_index=True), len(routing), job['grid'])
@@ -237,13 +197,11 @@ def prepare_region(job: dict) -> str:
             'description': 'proportions of runoff cells that intersect river catchments',
             'grid_path': str(job['grid_path']),
             'grid_shape': f'{job["grid"]["lat"].size} latitude x {job["grid"]["lon"].size} longitude',
-            'catchments_path': str(catchments_file),
+            'catchments_path': str(catchments_path),
             'row_order': 'rivers in the order of routing.parquet, then cells by area_sqm descending',
             'x_y': 'the longitude and latitude of the cell at x_index and y_index, as the grid gives them',
         },
     )
-    routing_dir.mkdir(parents=True, exist_ok=True)
-    write_in_place(routing_dir / 'routing.parquet', lambda path: routing.to_parquet(path, index=False))
     write_in_place(routing_dir / f'gridweights_ERA5_{region}.nc', dataset.to_netcdf)
     write_in_place(routing_dir / f'gridweights_ERA5_{region}.parquet', lambda path: write_jsrr_weights(weights, path))
 
@@ -254,41 +212,32 @@ def prepare_region(job: dict) -> str:
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--hydrography', type=Path, default=Path('/Users/rchales/data/rfsv3/hydrography'),
-                        help='the published hydrography, only read')
-    parser.add_argument('--routing', type=Path, default=Path('/Users/rchales/data/rfsv3/routing'),
-                        help='where the routing files are written, a region=<id> folder per region')
+    parser.add_argument('--hydrography', type=Path, default=HYDROGRAPHY, help='the published hydrography, only read')
+    parser.add_argument('--routing', type=Path, default=ROUTING,
+                        help='where 1_routing_files.py wrote routing.parquet, and the weights are written')
     parser.add_argument('--grid', type=Path, default=Path('/Users/rchales/data/era5/year=1940/era5_194001.nc'),
                         help='any file on the ERA5 grid, netCDF or zarr; only its longitude and latitude are read')
     parser.add_argument('--regions', nargs='+', help='prepare only these regions')
     parser.add_argument('--jobs', type=int, default=None, help='regions prepared at once, default every core')
-    parser.add_argument('--overwrite', action='store_true', help='rewrite regions whose files already exist')
+    parser.add_argument('--overwrite', action='store_true',
+                        help='rewrite regions whose files already exist, and the global ones')
     args = parser.parse_args()
 
     grid = read_grid(args.grid)
-    regions = sorted(d.name.split('=')[1] for d in args.hydrography.glob('region=*'))
-    regions = [r for r in regions if r != 'global' and (not args.regions or r in args.regions)]
-    if args.regions and (unknown := set(args.regions) - set(regions)):
-        raise SystemExit(f'no region={sorted(unknown)[0]} in {args.hydrography}')
+    regions = list_regions(args.hydrography, args.regions)
+    if missing := [r for r in regions if not (args.routing / f'region={r}' / 'routing.parquet').exists()]:
+        raise SystemExit(f'{len(missing)} regions have no routing.parquet, run 1_routing_files.py first: {missing[0]}')
 
 
     def done(region: str) -> bool:
         routing_dir = args.routing / f'region={region}'
-        files = ['routing.parquet', f'gridweights_ERA5_{region}.nc', f'gridweights_ERA5_{region}.parquet']
-        return all((routing_dir / name).exists() for name in files)
+        return all((routing_dir / f'gridweights_ERA5_{region}{suffix}').exists() for suffix in ('.nc', '.parquet'))
 
 
     todo = [r for r in regions if args.overwrite or not done(r)]
-    # biggest first, so the largest regions are not left running alone at the end
-    todo.sort(key=lambda r: -(args.hydrography / f'region={r}' / f'catchments_{r}.geo.parquet').stat().st_size)
-    jobs = min(args.jobs or os.cpu_count() or 8, max(len(todo), 1))
-    print(f'{len(todo)} of {len(regions)} regions to prepare, {jobs} at a time, on the '
+    print(f'{len(regions) - len(todo)} of {len(regions)} regions already have ERA5 weights, on the '
           f'{grid["lat"].size} x {grid["lon"].size} grid of {args.grid}', flush=True)
-
-    began = time.time()
-    with ProcessPoolExecutor(jobs) as pool:
-        futures = [pool.submit(prepare_region, {'region': r, 'hydrography': args.hydrography, 'grid': grid,
-                                                'routing': args.routing, 'grid_path': args.grid}) for r in todo]
-        for n, future in enumerate(as_completed(futures), start=1):
-            print(f'[{n}/{len(futures)}] {future.result()}', flush=True)
-    print(f'{len(todo)} regions prepared in {(time.time() - began) / 60:.1f} min', flush=True)
+    prepare_all(prepare_region, [{'region': r, 'hydrography': args.hydrography, 'grid': grid, 'routing': args.routing,
+                                  'grid_path': args.grid} for r in todo], args.jobs, 'weight on ERA5')
+    for name in ('gridweights_ERA5_{region}.nc', 'gridweights_ERA5_{region}.parquet'):
+        write_global(args.hydrography, args.routing, name, args.overwrite or bool(todo))
