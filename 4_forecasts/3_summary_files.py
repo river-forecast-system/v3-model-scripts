@@ -19,7 +19,10 @@ flow a river exceeds 95% of the time. The alerts read every member: a return per
 at least rfs_spec.ALERT_PROBABILITY of the members exceed it then, as the web app's exceedance tables count.
 
 The rivers are processed a block of whole shards at a time, --jobs blocks at once, and only the bytes and the alert
-rows are kept, about 0.6 GB for the world. Every file is written to a temporary name and renamed into place.
+rows are kept, about 0.6 GB for the world. Every file is written to a temporary name and renamed into place, and
+none that exists is replaced: alerts.csv is written last, so once it exists the step is finished and a rerun passes
+over it, and a rerun after an interruption writes only the stylesets whose styles.json, each one's last file, is
+missing. To write a file again, delete it first.
 """
 
 import argparse
@@ -135,12 +138,16 @@ if __name__ == '__main__':
     parser.add_argument('--hydrography', type=Path, default=Path.home() / 'data' / 'rfsv3' / 'hydrography',
                         help='the published hydrography, for each alert\'s river id and outlet')
     parser.add_argument('--jobs', type=int, default=os.cpu_count() or 8, help='processes reading blocks at once')
-    parser.add_argument('--shards-per-block', type=int, default=20, help='250 river shards each process reads at once')
+    parser.add_argument('--block', type=int, default=rfs_spec.FORECAST_BLOCK,
+                        help='rivers each process reads at once, a multiple of rfs_spec.FORECAST_BLOCK')
     args = parser.parse_args()
 
     began = time.time()
     initialization = args.initialization
     store = rfs_spec.forecast_store_path(args.out_root, initialization)
+    if (store.parent / 'alerts.csv').exists():  # written last, so every summary file is finished
+        print(f'{store.parent / "alerts.csv"} exists, so the summary files are finished and kept', flush=True)
+        raise SystemExit(0)
     for needed in (store, args.retrospective / 'return-periods.zarr', args.retrospective / 'fdc.zarr'):
         if not needed.exists():
             raise SystemExit(f'{needed} does not exist')
@@ -150,7 +157,9 @@ if __name__ == '__main__':
         if not np.array_equal(river_ids, zarr.open_array(str(store / 'riverId'), mode='r')[:]):
             raise SystemExit(f'{name} is not on the riverId axis of {store}')
 
-    block = rfs_spec.RIVERS_PER_SHARD * args.shards_per_block
+    block = args.block
+    if block < 1 or block % rfs_spec.FORECAST_BLOCK:
+        raise SystemExit(f'--block {block} must be a multiple of {rfs_spec.FORECAST_BLOCK}, whole shards of each array')
     jobs = [(store, args.retrospective, r0, min(r0 + block, n_rivers)) for r0 in range(0, n_rivers, block)]
     styles = {name: np.empty((n_rivers, rfs_spec.FORECAST_STEPS if name == 'timeseries' else 1), dtype=np.uint8)
               for name in rfs_spec.STYLESETS}
@@ -176,6 +185,8 @@ if __name__ == '__main__':
                      'there is no Q95',
     }
     for name, cube in styles.items():
+        if (day / 'maps' / name / 'styles.json').exists():  # finished by an interrupted run, and kept
+            continue
         rfs_spec.write_styles(day / 'maps' / name, name, cube, initialization,
                               times if cube.shape[1] > 1 else times[:1], descriptions[name])
     table = alert_table(pd.concat(alerts, ignore_index=True), initialization, args.hydrography)

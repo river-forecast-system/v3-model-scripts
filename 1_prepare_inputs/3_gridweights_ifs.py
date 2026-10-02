@@ -23,9 +23,9 @@ file is renamed into place.
 
 reduced_grid_weights reads a region's catchments whole, not in batches as 2_gridweights_era5.py does: region
 1020000010 peaks at 11.7 GB and the largest, 3020000010, at 31 GB, so by default only 4 regions run at once. Regions
-are prepared biggest first. A region whose weights exist is skipped unless --overwrite is passed. The global file
-is written once every region has its own, and rewritten when any region was. Each file is written to a temporary
-name and renamed into place, so an interrupted run never leaves a file that looks finished.
+are prepared biggest first. A region whose weights exist is skipped, as is a global file that exists; a file is only
+rebuilt once you delete it. The global file is written once every region has its own. Each file is written to a
+temporary name and renamed into place, so an interrupted run never leaves a file that looks finished.
 """
 
 import argparse
@@ -85,8 +85,6 @@ if __name__ == '__main__':
                         help='where 1_routing_files.py wrote routing.parquet, and the weights are written')
     parser.add_argument('--regions', nargs='+', help='prepare only these regions')
     parser.add_argument('--jobs', type=int, default=4, help='regions prepared at once, each up to 31 GB, default 4')
-    parser.add_argument('--overwrite', action='store_true',
-                        help='rewrite regions whose weights already exist, and the global ones')
     args = parser.parse_args()
 
     grid = ReducedGaussianGrid.from_grib(args.grib)
@@ -94,10 +92,9 @@ if __name__ == '__main__':
     regions = list_regions(args.hydrography, args.regions)
     if missing := [r for r in regions if not (args.routing / f'region={r}' / 'routing.parquet').exists()]:
         raise SystemExit(f'{len(missing)} regions have no routing.parquet, run 1_routing_files.py first: {missing[0]}')
-    todo = [r for r in regions
-            if args.overwrite or not (args.routing / f'region={r}' / f'gridweights_{name}_{r}.nc').exists()]
+    todo = [r for r in regions if not (args.routing / f'region={r}' / f'gridweights_{name}_{r}.nc').exists()]
     print(f'{len(regions) - len(todo)} of {len(regions)} regions already have {name} weights, on the '
           f'{grid.n_cells:,} cells ({grid.spacing_km:.1f} km) of {args.grib}', flush=True)
     prepare_all(prepare_region, [{'region': r, 'hydrography': args.hydrography, 'routing': args.routing,
                                   'grib': args.grib, 'name': name} for r in todo], args.jobs, f'weight on {name}')
-    write_global(args.hydrography, args.routing, f'gridweights_{name}_{{region}}.nc', args.overwrite or bool(todo))
+    write_global(args.hydrography, args.routing, f'gridweights_{name}_{{region}}.nc')

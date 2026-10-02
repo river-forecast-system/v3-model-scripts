@@ -41,9 +41,9 @@ extra bytes cost more over the network than they save in parsing, and 1.26 MB an
 encoded. jsrr refuses a region unless every river in routing.parquet has a weight, which weight_table checks, and every
 weight names one of its rivers, which holds because the weights take their river ids from routing.parquet by position.
 
-Regions are independent and run in parallel, biggest first. A region whose two weight files exist is skipped unless
---overwrite is passed. The global files are written once every region has its own, and rewritten when any region
-was. Each file is written to a temporary name and renamed into place, so an interrupted run never
+Regions are independent and run in parallel, biggest first. A region whose two weight files exist is skipped, as
+is a global file that exists; a file is only rebuilt once you delete it. The global files are written once every
+region has its own. Each file is written to a temporary name and renamed into place, so an interrupted run never
 leaves a file that looks finished.
 """
 
@@ -219,8 +219,6 @@ if __name__ == '__main__':
                         help='any file on the ERA5 grid, netCDF or zarr; only its longitude and latitude are read')
     parser.add_argument('--regions', nargs='+', help='prepare only these regions')
     parser.add_argument('--jobs', type=int, default=None, help='regions prepared at once, default every core')
-    parser.add_argument('--overwrite', action='store_true',
-                        help='rewrite regions whose files already exist, and the global ones')
     args = parser.parse_args()
 
     grid = read_grid(args.grid)
@@ -234,10 +232,10 @@ if __name__ == '__main__':
         return all((routing_dir / f'gridweights_ERA5_{region}{suffix}').exists() for suffix in ('.nc', '.parquet'))
 
 
-    todo = [r for r in regions if args.overwrite or not done(r)]
+    todo = [r for r in regions if not done(r)]
     print(f'{len(regions) - len(todo)} of {len(regions)} regions already have ERA5 weights, on the '
           f'{grid["lat"].size} x {grid["lon"].size} grid of {args.grid}', flush=True)
     prepare_all(prepare_region, [{'region': r, 'hydrography': args.hydrography, 'grid': grid, 'routing': args.routing,
                                   'grid_path': args.grid} for r in todo], args.jobs, 'weight on ERA5')
     for name in ('gridweights_ERA5_{region}.nc', 'gridweights_ERA5_{region}.parquet'):
-        write_global(args.hydrography, args.routing, name, args.overwrite or bool(todo))
+        write_global(args.hydrography, args.routing, name)

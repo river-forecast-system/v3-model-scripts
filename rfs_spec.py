@@ -8,22 +8,16 @@ keepbits value.
 Every store is Zarr v3 with consolidated metadata, riverId the first dimension of every array, every array compressed
 with blosc zstd alone, and discharge float32 rounded to KEEP_BITS before it is written, never by a codec filter.
 
-The retrospective stores: every discharge array is (riverId, time) float32, one river per chunk, 250 rivers per
-shard, and its time axis is cut at CHUNK_SPLIT_DATE so the historical record is one immutable chunk and an append only
-rewrites the chunk after it.
-
-A retrospective store is written one calendar year at a time, each year its own zarr at ``store_path``, holding every
-river in riverIndex order. A year is therefore whole in the river dimension the moment its regions are written, and the
-published record is those years merged along time, which no longer has to happen while the simulation runs. For a
-one-year store the CHUNK_SPLIT_DATE cut never lands inside the time axis, so a chunk is one river's whole year.
+The retrospective stores: every discharge array is (riverId, time) float32, chunked and sharded along riverId as
+LAYOUT says, and its time axis is cut at CHUNK_SPLIT_DATE so the historical record is one immutable chunk and an append
+only rewrites the chunk after it. A chunk is one river where a river's series in the array is at least a few KB, and
+many rivers where it is shorter; a shard holds about 5 to 750 MB. So no array of the 4.9 million rivers has more than
+20,000 shards, and no shard index, 16 bytes per chunk, is more than 64 KB.
 """
 
-import fcntl
 import json
 import os
 import zlib
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -38,10 +32,11 @@ DISCHARGE_ATTRS = {'long_name': 'Discharge at catchment outlet', 'standard_name'
 KEEP_BITS = 13
 # blosc is the only codec the browser clients can decode
 COMPRESSOR = zc.BloscCodec(cname='zstd', clevel=5, shuffle='shuffle')
-RIVERS_PER_SHARD = 250
 CHUNK_SPLIT_DATE = pd.Timestamp('2025-01-01')
-# Q_timesteps is every river at one step, for map styling: chunked across rivers and not sharded
+# Q_timesteps is every river at one step, for map styling: chunked across rivers, and on the monthly store sharded a
+# year at a time. The yearly store's 85 steps are left unsharded, 20 files each.
 TIMESTEPS_CHUNK = (250_000, 1)
+TIMESTEPS_SHARD = {'monthly': (250_000, 12), 'yearly': None}
 
 # name: (time axis frequency, discharge variables, aggregation_method, has Q_timesteps)
 STORES = {
@@ -51,6 +46,20 @@ STORES = {
     'yearly': ('YS', ('Q',), 'mean', True),
     'maximums': ('YS', ('hourly', 'daily'), 'max', False),
 }
+
+# each retrospective store's (rivers per chunk, rivers per shard) of its discharge arrays. The values of one river:
+# hourly 745,128 over 85 years, daily 31,047, monthly 1,020, yearly and maximums 85
+LAYOUT = {
+    'hourly': (1, 250),
+    'daily': (1, 1_000),
+    'monthly': (1, 4_000),
+    'yearly': (250, 50_000),
+    'maximums': (250, 50_000),
+}
+# return-periods.zarr's curves, 7 values a river, and fdc.zarr's, 101. The max_simulated arrays are unsharded chunks.
+RETURN_PERIODS_LAYOUT = (1_000, 250_000)
+FDC_LAYOUT = (250, 50_000)
+MAX_SIMULATED_CHUNK = 250_000
 
 _SHIFT = np.uint32(23 - KEEP_BITS)
 _HALF = np.uint32((1 << (22 - KEEP_BITS)) - 1)
@@ -126,11 +135,6 @@ def record_times(first_year: int, last_year: int) -> dict[str, pd.DatetimeIndex]
     return {name: pd.date_range(start, end, freq=freq, inclusive='left') for name, (freq, *_) in STORES.items()}
 
 
-def store_path(root: Path, name: str, year: int) -> Path:
-    """Where one year of one store lives: ``root/hourly/hourly_1980.zarr``, the years of a store side by side."""
-    return Path(root) / name / f'{name}_{year}.zarr'
-
-
 def create_store(path: Path, name: str, times: pd.DatetimeIndex, river_ids: np.ndarray) -> None:
     """Create one store, empty, with the spec's layout, encoding and metadata."""
     _, variables, aggregation, timesteps = STORES[name]
@@ -140,15 +144,15 @@ def create_store(path: Path, name: str, times: pd.DatetimeIndex, river_ids: np.n
     title = TITLE.format(name.capitalize())
     if times[0].year == times[-1].year:
         title = f'{title} {times[0].year}'
-    group = zarr.create_group(str(path), overwrite=True,
-                              attributes={'title': title, 'license': LICENSE})
+    group = zarr.create_group(str(path), attributes={'title': title, 'license': LICENSE})  # raises if it exists
     attrs = {**DISCHARGE_ATTRS, 'aggregation_method': aggregation, 'keepbits': KEEP_BITS}
     q = {'shape': (n_rivers, n_time), 'dtype': 'float32', 'fill_value': np.nan, 'compressors': [COMPRESSOR],
          'config': {'write_empty_chunks': True}, 'dimension_names': ('riverId', 'time'), 'attributes': attrs}
+    per_chunk, per_shard = LAYOUT[name]
     for variable in variables:
-        group.create_array(variable, chunks=(1, t_chunk), shards=(RIVERS_PER_SHARD, t_chunk), **q)
+        group.create_array(variable, chunks=(per_chunk, t_chunk), shards=(per_shard, t_chunk), **q)
     if timesteps:
-        group.create_array('Q_timesteps', chunks=TIMESTEPS_CHUNK, **q)
+        group.create_array('Q_timesteps', chunks=TIMESTEPS_CHUNK, shards=TIMESTEPS_SHARD[name], **q)
 
     hours = (times - times[0]) // pd.Timedelta(hours=1)
     time_var = group.create_array(
@@ -162,58 +166,6 @@ def create_store(path: Path, name: str, times: pd.DatetimeIndex, river_ids: np.n
     zarr.consolidate_metadata(str(path))
 
 
-@contextmanager
-def shard_lock(locks: Path, shard: int):
-    """flock one shard's lock file. It belongs to the open file, so it also excludes threads of the same process."""
-    Path(locks).mkdir(parents=True, exist_ok=True)
-    with open(Path(locks) / f'{shard}.lock', 'a') as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(handle, fcntl.LOCK_UN)
-
-
-def write_rows(array, start: int, values: np.ndarray, locks: Path, write_bytes: int) -> None:
-    """
-    Write ``values`` into rows [start, start + len(values)) of an array sharded along rivers.
-
-    Writing part of a shard rewrites the whole shard, so the first and last shard, which may hold a neighboring
-    region's rivers, are written under a lock. The shards between belong to this region alone and are written whole,
-    as many at a time as fit in ``write_bytes``.
-    """
-    width = array.shards[0]
-    stop = start + values.shape[0]
-    head = min(-(-start // width) * width, stop)
-    tail = max(stop // width * width, head)
-
-    def put(g0: int, g1: int) -> None:
-        array[g0:g1] = np.asarray(values[g0 - start:g1 - start], dtype=np.float32)
-
-    if head > start:
-        with shard_lock(locks, start // width):
-            put(start, head)
-    step = width * max(1, write_bytes // (width * array.shape[1] * 4))
-    for g0 in range(head, tail, step):
-        put(g0, min(g0 + step, tail))
-    if stop > tail:
-        with shard_lock(locks, tail // width):
-            put(tail, stop)
-
-
-def write_timesteps(path: Path, threads: int) -> None:
-    """Fill Q_timesteps from Q, one block of TIMESTEPS_CHUNK[0] rivers at a time. Blocks share no objects."""
-    group = zarr.open_group(str(path), mode='r+')
-    q, dst = group['Q'], group['Q_timesteps']
-    width = TIMESTEPS_CHUNK[0]
-
-    def put(r0: int) -> None:
-        dst[r0:r0 + width] = q[r0:r0 + width]
-
-    with ThreadPoolExecutor(threads) as pool:
-        list(pool.map(put, range(0, q.shape[0], width)))
-
-
 # The 15 day forecast, forecasts15/year=YYYY/month=MM/day=DD/discharge.zarr: Q (riverId, member, time), Qpercentiles
 # (riverId, percentiles, time) and Qmean (riverId, time), each chunk one river's whole ensemble over the whole horizon
 FORECAST_TITLE = 'River Forecast System v3 15 Day Forecast'
@@ -224,6 +176,11 @@ MEMBERS = np.arange(0, 51, dtype=np.int32)  # the control, 0, and the 50 perturb
 PERCENTILES = np.arange(0, 101, 10, dtype=np.int32)  # deciles: 0 is the ensemble minimum, 50 the median, 100 the max
 # ECMWF's own numbering: the control forecast is 0 and each perturbed forecast keeps its number. The specification says
 # 1..51 and must be updated to match.
+# each forecast array's (rivers per chunk, rivers per shard): Q is 6,120 values a river, Qpercentiles 1,320, Qmean 120
+FORECAST_LAYOUT = {'Q': (1, 250), 'Qpercentiles': (1, 1_000), 'Qmean': (250, 10_000)}
+# the rivers the forecast scripts read and write at once: whole shards of every forecast array, so no two processes
+# ever write one shard
+FORECAST_BLOCK = 10_000
 MEMBER_DESCRIPTION = 'IFS ensemble member: 0 the control forecast, 1..50 the perturbed forecasts of the same number'
 
 
@@ -261,6 +218,7 @@ def ensemble_summaries(q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 def create_forecast_store(path: Path, initialization: pd.Timestamp, river_ids: np.ndarray) -> None:
     """Create one forecast discharge store, empty, with the spec's layout, encoding and metadata."""
     n_rivers, n_members, n_percentiles = len(river_ids), MEMBERS.size, PERCENTILES.size
+    # path is the temporary name 2_discharge_zarr.py renames into place, so what is replaced is an unfinished store
     group = zarr.create_group(str(path), overwrite=True, attributes={
         'title': FORECAST_TITLE, 'license': LICENSE, 'initialization_time': f'{initialization:%Y-%m-%dT%H:%M:%SZ}'})
     # coordinates is CF's way to name lead_time a coordinate on the time dimension rather than a variable of its own
@@ -271,7 +229,8 @@ def create_forecast_store(path: Path, initialization: pd.Timestamp, river_ids: n
     for name, axis in arrays.items():
         inner = ((axis[1],) if axis else ()) + (FORECAST_STEPS,)
         dims = ('riverId', *((axis[0],) if axis else ()), 'time')
-        group.create_array(name, shape=(n_rivers, *inner), chunks=(1, *inner), shards=(RIVERS_PER_SHARD, *inner),
+        per_chunk, per_shard = FORECAST_LAYOUT[name]
+        group.create_array(name, shape=(n_rivers, *inner), chunks=(per_chunk, *inner), shards=(per_shard, *inner),
                            dimension_names=dims, attributes=attrs, **q)
 
     lead_time = np.arange(FORECAST_STEPS, dtype=np.int32) * FORECAST_STEP_HOURS

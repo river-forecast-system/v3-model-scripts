@@ -119,15 +119,15 @@ def concatenate_parquet(files: list[Path], path: Path) -> int:
     return len(table)
 
 
-def write_global(hydrography: Path, routing: Path, name: str, rewrite: bool) -> None:
+def write_global(hydrography: Path, routing: Path, name: str) -> None:
     """
     Concatenate every region's file ``name``, where {region} stands for the region's id, into routing/global/ as
     ``name`` with {region} as global, by concatenate_routing, concatenate_netcdf or concatenate_parquet as the name
-    says. An existing global file is kept unless ``rewrite``, and none is written until every region has its file.
+    says. An existing global file is kept, and none is written until every region has its file.
     """
     global_name = name.format(region='global')
     path = routing / 'global' / global_name
-    if path.exists() and not rewrite:
+    if path.exists():
         print(f'global/{global_name}: exists, kept', flush=True)
         return
     regions = list_regions(hydrography)

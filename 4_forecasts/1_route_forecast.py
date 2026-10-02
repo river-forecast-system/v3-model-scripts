@@ -8,8 +8,8 @@ Each is a netCDF file labeled with its coordinates, so it says what it holds wit
 in rfs_spec.MEMBERS, riverId, and time, the start of each 3 hour interval. They are uncompressed, since they are only
 read once, by 2_discharge_zarr.py, which always deletes them when the store is written.
 
-The forecast is the 51 GRIB files of one initialization in --ifs, ro_<YYYYMMDD>_<HH>z_<cf|pf1..pf50>.grib, the runoff
-of the control and 50 perturbed forecasts on the O1280 grid, accumulated from the initialization. They are read as
+The forecast is the 51 GRIB files of one initialization in --ifs, <cf_00|pf_01..pf_50>_<YYYYMMDD>.grib, the runoff
+of the control and 50 perturbed forecasts of the 00 UTC run on the O1280 grid, accumulated from the initialization. They are read as
 they are, by river-route's ecmwf_grib forcing, with the global routing.parquet and gridweights_O1280_global.nc of
 1_prepare_inputs. Routing the world at once reads each file once, where routing by region would read each file once
 per region, which is what costs the most on networked storage.
@@ -34,8 +34,8 @@ Every member starts from --init-state, a channel state parquet with one Q per ri
 network, in the order of routing.parquet. The specification initializes the forecasts from the retrospective; without
 --init-state the channels start empty, which is right only for testing.
 
-A member whose file exists is not routed again unless --overwrite is passed. Each file is written to a temporary name
-and renamed into place, so an interrupted run never leaves a file that looks finished.
+A member whose file exists is not routed again; delete it to route it again. Each file is written to a temporary
+name and renamed into place, so an interrupted run never leaves a file that looks finished.
 """
 
 import argparse
@@ -54,7 +54,7 @@ import xarray as xr
 
 import rfs_spec
 
-GRIB_NAME = re.compile(r'ro_(\d{8})_(\d{2})z_(cf|pf)(\d*)\.grib')
+GRIB_NAME = re.compile(r'(cf|pf)_(\d{2})_(\d{8})\.grib')  # every file is of the 00 UTC run
 DT_ROUTING = 3600  # the retrospective's, so the two share channel states
 NETWORK_TYPE = 'stabilized'
 
@@ -87,19 +87,21 @@ class ForecastRunoff(rr.runoff.ECMWFGribReducedGrid):
 
 def forecast_files(ifs: Path, initialization: pd.Timestamp) -> dict[int, Path]:
     """Each member's GRIB file of one initialization, by member number."""
+    if initialization != initialization.normalize():
+        raise SystemExit(f'{initialization} is not a 00 UTC run, the only run whose GRIB files are downloaded')
     files = {}
-    for path in ifs.glob(f'ro_{initialization:%Y%m%d}_{initialization:%H}z_*.grib'):
+    for path in ifs.glob(f'*_{initialization:%Y%m%d}.grib'):
         if match := GRIB_NAME.fullmatch(path.name):
-            files[rfs_spec.member_number(match[3], int(match[4] or 0))] = path
+            files[rfs_spec.member_number(match[1], int(match[2]))] = path
     return dict(sorted(files.items()))
 
 
 def latest_initialization(ifs: Path) -> pd.Timestamp:
     """The newest initialization with any GRIB file in ``ifs``."""
-    found = [GRIB_NAME.fullmatch(p.name) for p in ifs.glob('ro_*.grib')]
-    stamps = sorted({pd.Timestamp(f'{m[1]}T{m[2]}') for m in found if m})
+    found = [GRIB_NAME.fullmatch(p.name) for p in ifs.glob('*.grib')]
+    stamps = sorted({pd.Timestamp(m[3]) for m in found if m})
     if not stamps:
-        raise SystemExit(f'no IFS runoff files ro_<YYYYMMDD>_<HH>z_<member>.grib in {ifs}')
+        raise SystemExit(f'no IFS runoff files <cf|pf>_<member>_<YYYYMMDD>.grib in {ifs}')
     return stamps[-1]
 
 
@@ -166,7 +168,7 @@ if __name__ == '__main__':
     parser.add_argument('--initialization', type=pd.Timestamp, default=None,
                         help='the forecast initialization, e.g. 2026-09-27T00; default the newest in --ifs')
     parser.add_argument('--ifs', type=Path, default=Path.home() / 'data' / 'rfsv3' / 'forcings' / 'ifs',
-                        help='the IFS runoff GRIB files, ro_<YYYYMMDD>_<HH>z_<cf|pfN>.grib')
+                        help='the IFS runoff GRIB files, <cf_00|pf_NN>_<YYYYMMDD>.grib')
     parser.add_argument('--routing', type=Path, default=Path.home() / 'data' / 'rfsv3' / 'routing',
                         help='the routing files of 1_prepare_inputs, whose global/ is routed')
     parser.add_argument('--work-dir', type=Path, default=Path.home() / 'data' / 'rfsv3' / 'forecasts-work',
@@ -175,7 +177,6 @@ if __name__ == '__main__':
                         help='channel state parquet every member starts from; default empty channels')
     parser.add_argument('--members', type=int, nargs='+', help='route only these members, 0 the control and 1..50')
     parser.add_argument('--threads', type=int, default=os.cpu_count() or 8, help='routing threads')
-    parser.add_argument('--overwrite', action='store_true', help='route members whose discharge is already saved')
     args = parser.parse_args()
 
     began = time.time()
@@ -186,7 +187,7 @@ if __name__ == '__main__':
         raise SystemExit(f'{initialization:%Y-%m-%d %H}z has no GRIB file in {args.ifs} for members {missing}')
     work_dir = args.work_dir / f'{initialization:%Y%m%d%H}'
     work_dir.mkdir(parents=True, exist_ok=True)
-    todo = [m for m in wanted if args.overwrite or not member_file(work_dir, m).exists()]
+    todo = [m for m in wanted if not member_file(work_dir, m).exists()]
     print(f'{initialization:%Y-%m-%d %H}z: {len(wanted) - len(todo)} of {len(wanted)} members already routed, '
           f'into {work_dir}', flush=True)
     if not todo:

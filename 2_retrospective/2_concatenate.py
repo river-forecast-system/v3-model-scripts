@@ -1,5 +1,5 @@
 """
-Concatenate the hourly discharge 2_route_regions.py writes, one zarr per region per calendar year, into the published
+Concatenate the hourly discharge 1_route_regions.py writes, one zarr per region per calendar year, into the published
 whole-record stores, and upload them to S3 while they are written:
 
     <out-dir>/hourly.zarr      Q: every hour of the record
@@ -8,27 +8,29 @@ whole-record stores, and upload them to S3 while they are written:
     <out-dir>/yearly.zarr      Q: the yearly means, and Q_timesteps
     <out-dir>/maximums.zarr    hourly and daily: each year's largest hourly value and largest daily mean
 
-laid out as rfs_spec.py says, one river's whole record per chunk and 250 rivers per shard, with the values of
-rfs_spec.reduce_year. 3_reduce_hourly.py is the simple version of this step, which writes only the reductions, one store
-per year. This one is built so that the ~15 TB of hourly record is read once and written once.
+laid out as rfs_spec.py says, with the values of rfs_spec.reduce_year. It is built so that the ~15 TB of hourly record
+is read once and written once, and every reduction is made in the same pass.
 
-An output shard is 250 rivers over every year, and an input chunk is 500 rivers of one year, so no shard can be
-written until every year of its rivers is read. The rivers are cut into segments of whole shards, and a process
-streams through its segment in riverIndex order: it reads the next input chunk of every year into a buffer, reduces
-and writes every shard the buffer now completes, and carries the rest, fewer than 250 rivers, on to the next chunk.
-The buffer holds at most 749 rivers of the whole record, 2.2 GB, and nothing is written twice or read back. The only
-input read twice is the chunk each cut between segments falls in. Segments shrink as the work runs out, each a
-1 / (2 * --processes) share of what is left and at least MIN_SEGMENT_SHARDS, so the processes finish together.
+hourly and daily are written as the record streams through. An hourly shard is 250 rivers over every year, a daily
+shard 1,000, and an input chunk is 500 rivers of one year, so no shard can be written until every year of its rivers
+is read. The rivers are cut into segments of whole daily shards, and a process streams through its segment in
+riverIndex order: it reads the next input chunk of every year into a buffer, reduces and writes every hourly shard the
+buffer now completes, and carries the rest, fewer than 250 rivers, on to the next chunk. The daily means wait in a
+second buffer until they fill a daily shard. The hourly buffer holds at most 749 rivers of the whole record, 2.2 GB,
+and nothing is written twice or read back. The only input read twice is the chunk each cut between segments falls in.
+Segments shrink as the work runs out, each a 1 / (2 * --processes) share of what is left and at least
+MIN_SEGMENT_UNITS daily shards, so the processes finish together.
 
-Whole shards are encoded here, a river per blosc call on --threads threads, and written straight to their files,
-byte for byte what zarr writes. zarr costs about 350 us per chunk whatever its size, which is 40 times the encoding of
-a yearly chunk, and lost in the compression of an hourly one. Each process first checks on a small shard that
-shard_bytes reproduces zarr's bytes for the array's codecs, and writes through zarr if it does not. The last shard,
-which holds fewer than 250 rivers, always goes through zarr.
+Whole shards of one-river chunks are encoded here, a river per blosc call on --threads threads, and written straight to
+their files, byte for byte what zarr writes. zarr costs about 350 us per chunk whatever its size, which is lost in the
+compression of an hourly chunk but not of a monthly one. Each process first checks on a small shard that shard_bytes
+reproduces zarr's bytes for the array's codecs, and writes through zarr if it does not. The last shard, which holds
+fewer rivers than the others, always goes through zarr.
 
-Q_timesteps is every river at one step, so it cannot be written until every segment is. Each segment also writes its
-monthly and yearly values into two .npy files in --work-dir, 22 GB together, and Q_timesteps is written from those at
-the end, rather than by reading 4.9 million chunks back out of the stores.
+monthly, yearly and maximums are hundreds or thousands of times smaller than hourly, and their shards are tens of
+thousands of rivers, more than a segment's cut can be put between. So each segment writes their values into .npy files
+in --work-dir, 25 GB together for 85 years, and they are written from those once every segment is done, along with
+Q_timesteps, which is every river at one step and cannot be written until every segment is either.
 
 With --s3-url, every file of the stores is uploaded to the same key under that prefix. The main process uploads each
 segment's shards as it reports them written, on --upload-threads threads, from files still in the page cache, so the
@@ -36,7 +38,7 @@ build never waits on the network. The metadata goes first, so a bad bucket or cr
 built. Each uploaded file is logged in --work-dir, and a rerun uploads only what the log lacks.
 
 A rerun resumes. Each segment records in --work-dir the rivers it has written, after their shards and .npy rows, and
-continues from there. --overwrite deletes the stores and --work-dir and starts over.
+continues from there. Nothing is ever deleted: to build the stores again, delete them and --work-dir first.
 """
 
 import argparse
@@ -63,17 +65,20 @@ import rfs_spec
 
 warnings.filterwarnings('ignore', message='Consolidated metadata', category=UserWarning)
 
-SHARD = rfs_spec.RIVERS_PER_SHARD
-# the smallest segment, 10,000 rivers: its cuts reread at most two of river-route's 500 river chunks
-MIN_SEGMENT_SHARDS = 40
+EMIT = rfs_spec.LAYOUT['hourly'][1]  # rivers reduced and written at once: one hourly shard
+UNIT = rfs_spec.LAYOUT['daily'][1]  # rivers a segment is cut on: one daily shard, a whole number of hourly ones
+# the smallest segment, 10 daily shards or 10,000 rivers: its cuts reread at most two of river-route's 500 river chunks
+MIN_SEGMENT_UNITS = 10
 POLL_SECONDS = 5
 MULTIPART_BYTES = 64 * 2**20  # files larger than this are uploaded in parts of this size
-# each reduction by rfs_spec.reduce_year's name, and 'hourly' for the record: the store and variable it is written to
-WRITTEN = {'hourly': ('hourly', 'Q'), 'daily': ('daily', 'Q'), 'monthly': ('monthly', 'Q'), 'yearly': ('yearly', 'Q'),
-           'max_hourly': ('maximums', 'hourly'), 'max_daily': ('maximums', 'daily')}
+# 'hourly' for the record and each reduction by rfs_spec.reduce_year's name: the store and variable it is written to.
+# STREAMED are written as each segment streams, KEPT are kept in --work-dir and written once every segment is done
+STREAMED = {'hourly': ('hourly', 'Q'), 'daily': ('daily', 'Q')}
+KEPT = {'monthly': ('monthly', 'Q'), 'yearly': ('yearly', 'Q'), 'max_hourly': ('maximums', 'hourly'),
+        'max_daily': ('maximums', 'daily')}
 SHUFFLES = {'noshuffle': numcodecs.Blosc.NOSHUFFLE, 'shuffle': numcodecs.Blosc.SHUFFLE,
             'bitshuffle': numcodecs.Blosc.BITSHUFFLE}
-TIMESTEPS = ('monthly', 'yearly')  # the stores with Q_timesteps, whose values are also kept in --work-dir
+TIMESTEPS = ('monthly', 'yearly')  # the stores with Q_timesteps, written from the same kept values as their Q
 # river-route names the discharge of runoff file era5_194001_194012.zarr discharge_era5_194001_194012.zarr
 DISCHARGE = re.compile(r'discharge_(?P<stem>.*_(?P<year>\d{4})01_(?P=year)12)\.zarr')
 
@@ -101,14 +106,14 @@ def check_input(path: Path, river_ids: np.ndarray, year: int) -> tuple[int, int]
 
 
 def plan_segments(n_rivers: int, processes: int) -> list[tuple[int, int]]:
-    """Cut the rivers into segments of whole shards, largest first: each is 1 / (2 * processes) of the shards left and
-    at least MIN_SEGMENT_SHARDS, so the last to start are small and the processes finish together."""
-    shards = -(-n_rivers // SHARD)
+    """Cut the rivers into segments of whole daily shards, largest first: each is 1 / (2 * processes) of the shards left
+    and at least MIN_SEGMENT_UNITS, so the last to start are small and the processes finish together."""
+    units = -(-n_rivers // UNIT)
     cuts = [0]
-    while cuts[-1] < shards:
-        left = shards - cuts[-1]
-        cuts.append(cuts[-1] + min(left, max(MIN_SEGMENT_SHARDS, -(-left // (2 * processes)))))
-    return [(a * SHARD, min(b * SHARD, n_rivers)) for a, b in zip(cuts, cuts[1:], strict=False)]
+    while cuts[-1] < units:
+        left = units - cuts[-1]
+        cuts.append(cuts[-1] + min(left, max(MIN_SEGMENT_UNITS, -(-left // (2 * processes)))))
+    return [(a * UNIT, min(b * UNIT, n_rivers)) for a, b in zip(cuts, cuts[1:], strict=False)]
 
 
 def progress(work_dir: Path, segment: int, first: int) -> int:
@@ -138,17 +143,17 @@ def shard_bytes(chunks: list[bytes]) -> list[bytes]:
 def shard_codec(array: zarr.Array) -> numcodecs.Blosc | None:
     """
     The blosc codec to encode the array's whole shards with, or None if they must be written through zarr: when a
-    shard is not SHARD one-river chunks over the whole time axis, or when shard_bytes does not reproduce what zarr
-    writes for the array's compressor, checked on a shard of random values.
+    shard is not one-river chunks over the whole time axis, or when shard_bytes does not reproduce what zarr writes
+    for the array's compressor, checked on a shard of random values.
     """
-    if array.chunks != (1, array.shape[1]) or array.shards != (SHARD, array.shape[1]) or len(array.compressors) != 1:
+    if array.chunks != (1, array.shape[1]) or array.shards[1] != array.shape[1] or len(array.compressors) != 1:
         return None
     (codec,) = array.compressors
     if not isinstance(codec, zarr.codecs.BloscCodec):
         return None
     blosc = numcodecs.Blosc(cname=codec.cname, clevel=codec.clevel, shuffle=SHUFFLES[codec.shuffle],
                             blocksize=codec.blocksize, typesize=codec.typesize)
-    probe, values = {}, np.random.default_rng(0).lognormal(3, 2, (SHARD, 100)).astype(array.dtype)
+    probe, values = {}, np.random.default_rng(0).lognormal(3, 2, (array.shards[0], 100)).astype(array.dtype)
     zarr.create_array(store=zarr.storage.MemoryStore(probe), shape=values.shape, chunks=(1, 100), shards=values.shape,
                       dtype=array.dtype, fill_value=array.fill_value, compressors=array.compressors,
                       config={'write_empty_chunks': True})[:] = values
@@ -157,41 +162,47 @@ def shard_codec(array: zarr.Array) -> numcodecs.Blosc | None:
 
 def write_rivers(array: zarr.Array, codec: numcodecs.Blosc | None, path: Path, values: np.ndarray, row: int,
                  pool: ThreadPoolExecutor, threads: int) -> None:
-    """Write rivers [row, row + len(values)) of the array stored at path, row on a shard boundary: whole shards encoded
-    here and written straight to their files, and a last shard of fewer than SHARD rivers through zarr."""
-    whole = len(values) // SHARD * SHARD if codec else 0
+    """Write rivers [row, row + len(values)) of the array stored at path, row on a shard boundary: with a codec, whole
+    shards encoded here and written straight to their files, and a last shard of fewer rivers through zarr; without
+    one, everything through zarr."""
+    width = array.shards[0]
+    whole = len(values) // width * width if codec else 0
     if whole:
         bounds = np.linspace(0, whole, threads + 1).astype(int)
         parts = pool.map(lambda a, b: [codec.encode(river) for river in values[a:b]], bounds[:-1], bounds[1:])
         chunks = [chunk for part in parts for chunk in part]
-        for k in range(0, whole, SHARD):
-            file = path / array.metadata.encode_chunk_key(((row + k) // SHARD, 0))
+        for k in range(0, whole, width):
+            file = path / array.metadata.encode_chunk_key(((row + k) // width, 0))
             file.parent.mkdir(parents=True, exist_ok=True)
             with open(file, 'wb') as handle:
-                handle.writelines(shard_bytes(chunks[k:k + SHARD]))
+                handle.writelines(shard_bytes(chunks[k:k + width]))
     if whole < len(values):
         array[row + whole:row + len(values)] = values[whole:]
 
 
 def build_segment(job: dict) -> None:
-    """Stream one segment of rivers, in riverIndex order, from the input chunks into whole shards of every store."""
+    """Stream one segment of rivers, in riverIndex order, from the input chunks into whole shards of hourly and daily,
+    and the kept values of the other stores."""
     segment, (first, end), columns = job['segment'], job['rows'], job['columns']
     start = progress(job['work_dir'], segment, first)
     if start >= end:
         return
     n_years, n_days = len(columns), columns[-1][4]
     out, work, threads = job['out_dir'], job['work_dir'], job['threads']
-    paths = {name: out / f'{store}.zarr' / variable for name, (store, variable) in WRITTEN.items()}
+    paths = {name: out / f'{store}.zarr' / variable for name, (store, variable) in STREAMED.items()}
     targets = {name: zarr.open_array(str(path), mode='r+') for name, path in paths.items()}
     codecs = {name: shard_codec(array) for name, array in targets.items()}
-    kept = {name: np.load(work / f'{name}.npy', mmap_mode='r+') for name in TIMESTEPS}
+    kept = {name: np.load(work / f'{name}.npy', mmap_mode='r+') for name in KEPT}
     widths = {'daily': n_days, 'monthly': 12 * n_years, 'yearly': n_years, 'max_hourly': n_years,
               'max_daily': n_years}
 
     # rows are rivers from `row` on, columns every hour of the record. Only the hours before the first year's input
     # starts are never read into it, so they are the only ones set here
-    buffer = np.empty((SHARD - 1 + job['max_block'], targets['hourly'].shape[1]), np.float32)
+    buffer = np.empty((EMIT - 1 + job['max_block'], targets['hourly'].shape[1]), np.float32)
     buffer[:, :columns[0][1]] = np.nan
+    # the daily means of rivers from `daily_row` on, reduced but not yet written: fewer than a daily shard between emits
+    daily = np.empty((UNIT - 1 + buffer.shape[0], n_days), np.float32)
+    daily_row, pending = start, 0
     sources = {}  # the Q array of every year of the region being read
 
     def read(region: str, l0: int, l1: int, at: int, pool: ThreadPoolExecutor) -> None:
@@ -208,7 +219,9 @@ def build_segment(job: dict) -> None:
         list(pool.map(one, range(n_years)))
 
     def emit(n: int, row: int, pool: ThreadPoolExecutor) -> None:
-        """Reduce buffer rows [0, n), rounding them onto the keepbits grid, and write them as rivers [row, row + n)."""
+        """Reduce buffer rows [0, n), rounding them onto the keepbits grid, write them as hourly rivers [row, row + n),
+        keep their reductions, and write every daily shard now complete, or every daily row at the segment's end."""
+        nonlocal daily_row, pending
         rows = buffer[:n]
         reduced = {name: np.empty((n, width), np.float32) for name, width in widths.items()}
 
@@ -221,11 +234,16 @@ def build_segment(job: dict) -> None:
                 reduced[name][:, i] = values[name]
 
         list(pool.map(one, range(n_years)))
-        for name, array in targets.items():
-            write_rivers(array, codecs[name], paths[name], rows if name == 'hourly' else reduced[name], row, pool,
-                         threads)
+        write_rivers(targets['hourly'], codecs['hourly'], paths['hourly'], rows, row, pool, threads)
         for name, values in kept.items():
             values[row:row + n] = reduced[name]
+        daily[pending:pending + n] = reduced['daily']
+        pending += n
+        k = pending if row + n == end else pending // UNIT * UNIT
+        if k:
+            write_rivers(targets['daily'], codecs['daily'], paths['daily'], daily[:k], daily_row, pool, threads)
+            daily[:pending - k] = daily[k:pending]
+            daily_row, pending = daily_row + k, pending - k
 
     record = job['work_dir'] / 'progress' / str(segment)
     row, filled = start, 0  # buffer row 0 is river `row`, and rows [0, filled) are read but not yet written
@@ -236,17 +254,33 @@ def build_segment(job: dict) -> None:
                 continue
             read(region, l0 + lo - g0, l0 + hi - g0, filled, pool)
             filled += hi - lo
-            n = filled if row + filled == end else filled // SHARD * SHARD
+            n = filled if row + filled == end else filled // EMIT * EMIT
             if not n:
                 continue
+            written = daily_row
             emit(n, row, pool)
-            buffer[:filled - n] = buffer[n:filled]  # fewer than SHARD rows from at least SHARD on: they never overlap
+            buffer[:filled - n] = buffer[n:filled]  # fewer than EMIT rows from at least EMIT on: they never overlap
             row, filled = row + n, filled - n
-            partial = record.with_suffix('.partial')
-            partial.write_text(str(row))
-            os.replace(partial, record)
-    if row != end or filled:
-        raise RuntimeError(f'segment {segment} ended at river {row} with {filled} unwritten, not at {end}')
+            if daily_row > written:  # every store has its rivers up to daily_row, which a rerun resumes from
+                partial = record.with_suffix('.partial')
+                partial.write_text(str(daily_row))
+                os.replace(partial, record)
+    if row != end or filled or pending:
+        raise RuntimeError(f'segment {segment} ended at river {row} with {filled + pending} unwritten, not at {end}')
+
+
+def write_kept(out_dir: Path, work_dir: Path, threads: int) -> None:
+    """Write the monthly, yearly and maximums arrays from the values kept in work_dir, whole shards at a time, and
+    then Q_timesteps."""
+    with ThreadPoolExecutor(threads) as pool:
+        for name, (store, variable) in KEPT.items():
+            path = out_dir / f'{store}.zarr' / variable
+            array = zarr.open_array(str(path), mode='r+')
+            codec, values = shard_codec(array), np.load(work_dir / f'{name}.npy', mmap_mode='r')
+            step = array.shards[0] * threads  # a shard a thread, or as many as zarr writes at once
+            for r0 in range(0, values.shape[0], step):
+                write_rivers(array, codec, path, np.asarray(values[r0:r0 + step]), r0, pool, threads)
+    write_timesteps(out_dir, work_dir, threads)
 
 
 def write_timesteps(out_dir: Path, work_dir: Path, threads: int) -> None:
@@ -352,10 +386,11 @@ if __name__ == '__main__':
     parser.add_argument('--routing', type=Path, default=Path.home() / 'data' / 'rfsv3' / 'routing',
                         help='where 1_prepare_inputs/ wrote each region\'s routing files')
     parser.add_argument('--discharge-root', type=Path, default=Path.home() / 'data' / 'rfsv3' / 'discharge',
-                        help='where 2_route_regions.py wrote the hourly discharge')
+                        help='where 1_route_regions.py wrote the hourly discharge')
     parser.add_argument('--out-dir', type=Path, default=Path.home() / 'data' / 'rfsv3' / 'retrospective')
-    parser.add_argument('--work-dir', type=Path, help='progress, the upload log, and the monthly and yearly values '
-                                                      'Q_timesteps is written from, 22 GB. Default <out-dir>/.work')
+    parser.add_argument('--work-dir', type=Path, help='progress, the upload log, and the monthly, yearly and maximum '
+                                                      'values those stores are written from, 25 GB for 85 years. '
+                                                      'Default <out-dir>/.work')
     parser.add_argument('--processes', type=int, default=max(1, cores // 4), help='segments built at once')
     parser.add_argument('--threads', type=int, default=4, help='threads each process decodes, reduces and encodes on')
     parser.add_argument('--s3-url', help='s3://bucket/prefix to upload the stores to as they are written')
@@ -363,7 +398,6 @@ if __name__ == '__main__':
     parser.add_argument('--storage-class', help='S3 storage class of every upload, e.g. INTELLIGENT_TIERING. '
                                                 'Default the bucket\'s')
     parser.add_argument('--upload-threads', type=int, default=16, help='files uploaded at once')
-    parser.add_argument('--overwrite', action='store_true', help='delete the stores and --work-dir and start over')
     args = parser.parse_args()
     work = args.work_dir or args.out_dir / '.work'
     if args.processes < 1 or args.threads < 1 or args.processes * args.threads > cores:
@@ -416,30 +450,29 @@ if __name__ == '__main__':
                    for l0 in range(0, end - start, chunk_rows[region])]
 
     stores = {name: args.out_dir / f'{name}.zarr' for name in rfs_spec.STORES}
-    if args.overwrite:
-        for directory in (work, *stores.values()):
-            shutil.rmtree(directory, ignore_errors=True)
-    layout_file, layout = work / 'layout.json', {'rivers': int(river_ids.size), 'years': [years[0], years[-1]]}
+    layout_file, layout = work / 'layout.json', {'rivers': int(river_ids.size), 'years': [years[0], years[-1]],
+                                                 'kept': list(KEPT), 'unit': UNIT}
     if layout_file.exists():
         saved = json.loads(layout_file.read_text())
-        if {key: saved[key] for key in layout} != layout:
-            raise SystemExit(f'{work} is for {saved["rivers"]:,} rivers over {saved["years"]}: pass --overwrite')
+        if {key: saved.get(key) for key in layout} != layout:
+            raise SystemExit(f'{work} is for {saved["rivers"]:,} rivers over {saved["years"]}: delete it and the '
+                             f'stores in {args.out_dir} to build them again')
         segments = [tuple(s) for s in saved['segments']]
     else:
         if existing := [str(p) for p in stores.values() if p.exists()]:
             raise SystemExit(f'{existing[0]} exists but {layout_file} does not, so it cannot be resumed: '
-                             f'pass --overwrite')
+                             f'delete the stores in {args.out_dir} to build them again')
         (work / 'progress').mkdir(parents=True, exist_ok=True)
         segments = plan_segments(river_ids.size, args.processes)
         for name, path in stores.items():
             rfs_spec.create_store(path, name, times[name], river_ids)
-        for name in TIMESTEPS:
+        for name, (store, _) in KEPT.items():
             np.lib.format.open_memmap(work / f'{name}.npy', mode='w+', dtype=np.float32,
-                                      shape=(river_ids.size, len(times[name])))
+                                      shape=(river_ids.size, len(times[store])))
         layout_file.write_text(json.dumps({**layout, 'segments': segments}))  # last, so it marks all of the above
 
     raw = river_ids.size * len(times['hourly']) * 4
-    per_process = (SHARD - 1 + max(chunk_rows.values())) * len(times['hourly']) * 4
+    per_process = (EMIT - 1 + max(chunk_rows.values())) * len(times['hourly']) * 4
     sample = sum(f.stat().st_size for r in regions for f in (inputs[r][years[-1]] / 'Q').rglob('*') if f.is_file())
     free = shutil.disk_usage(args.out_dir).free
     print(f'{river_ids.size:,} rivers in {len(regions)} regions, {years[0]}..{years[-1]}: {raw / 1e12:.1f} TB of '
@@ -471,8 +504,9 @@ if __name__ == '__main__':
         wait(uploader.futures)
         if uploader.failed:
             raise SystemExit(f'could not upload the stores\' metadata to {args.s3_url}')
-        sharded = {(name, variable): zarr.open_array(str(path / variable), mode='r')
-                   for name, path in stores.items() for variable in rfs_spec.STORES[name][1]}
+        # the shards each segment writes as it goes; the kept stores are uploaded once they are written at the end
+        sharded = {(store, variable): zarr.open_array(str(stores[store] / variable), mode='r')
+                   for store, variable in STREAMED.values()}
         queued = {i: first for i, (first, _) in enumerate(segments)}  # rivers of each segment queued for upload
 
     def rivers_written() -> int:
@@ -503,12 +537,13 @@ if __name__ == '__main__':
     built = time.time()
 
     complete = all(progress(work, i, first) >= end for i, (first, end) in enumerate(segments))
-    if complete and not (work / 'Q_timesteps').exists():
-        write_timesteps(args.out_dir, work, cores)
-        (work / 'Q_timesteps').touch()
+    if complete and not (work / 'kept_written').exists():
+        numcodecs.blosc.use_threads = False  # the shards are already spread over threads
+        write_kept(args.out_dir, work, cores)
+        (work / 'kept_written').touch()
     if uploader:
         if complete:
-            uploader.submit(store_files(args.out_dir, data=True))  # Q_timesteps, and anything a crash left unsent
+            uploader.submit(store_files(args.out_dir, data=True))  # the kept stores, and anything a crash left unsent
         while uploader.pending():
             time.sleep(POLL_SECONDS)
             bar.set_postfix_str(uploader.status())

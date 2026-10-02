@@ -16,6 +16,11 @@ and this project, so every folder imports `rfs_spec`.
 dtypes, codec, keepbits, chunks and shards, the time axes and coordinates, and each store's metadata. The specification
 names it the source of truth for encodings, and where the two disagree the specification wins and the module is fixed.
 
+`config.sh` holds the settings of every step: the data paths, the record's years, and the processes and threads each
+step runs on. Each folder's `simulate.sh` sources it and runs that folder's scripts in order. Every setting is exported
+and keeps a value already set in the environment, so a run is configured without editing the file:
+`FIRST_YEAR=1940 WARM_UP_YEARS=0 2_retrospective/simulate.sh`.
+
 ## 1_prepare_inputs
 
 Writes the routing files into `--routing`, `~/data/rfsv3/routing` by default: one `region=<id>` folder per region of
@@ -31,11 +36,11 @@ python 1_prepare_inputs/3_gridweights_ifs.py --grib <any IFS .grib>  # gridweigh
 The router reads `routing.parquet` (`river_id`, `next_river_id`, `k`, `x`) and one weight table for its forcing, the
 share of each catchment in each grid cell. Every file lists rivers in `riverIndex` order, which is topological. The
 router pairs weights with rivers by position, not by id, so the weights read the river order from `routing.parquet`,
-which must be written first. Each script skips files that already exist unless you pass `--overwrite`.
+which must be written first. Each script skips files that already exist; a file is only rebuilt once you delete it.
 
 Each script also writes the global version of its files into `global/`, as `routing.parquet` and
-`gridweights_<grid>_global.nc`, once every region has its own. It rebuilds them whenever it rewrote a region. Global
-files let the whole world route in one process on many threads. That is faster when reading the forcing costs more
+`gridweights_<grid>_global.nc`, once every region has its own, and keeps a global file that exists, so after
+replacing a region's file, delete the global one too. Global files let the whole world route in one process on many threads. That is faster when reading the forcing costs more
 than routing it. An example is a GRIB forecast on the networked storage of an HPC: routing the world at once reads it
 one time, where routing by region reads it once per region.
 
@@ -79,73 +84,51 @@ file is renamed into place.
 
 ## 2_retrospective
 
-Builds `hourly`, `daily`, `monthly`, `yearly` and `maximums` from ERA5 runoff and the v3 hydrography, laid out as
-`rfs_spec.py` says. It routes with the `routing.parquet`
+Builds the published retrospective stores, `hourly`, `daily`, `monthly`, `yearly`, `maximums` and `return-periods`,
+from hourly ERA5 runoff and the v3 hydrography, laid out as `rfs_spec.py` says. It routes with the `routing.parquet`
 and `gridweights_ERA5_<id>.nc` of `1_prepare_inputs/`.
 
 ```bash
-python 2_retrospective/2_prepare_runoff.py                      # monthly ERA5 netCDFs -> one zarr per year
-python ../river-route/benchmarks/concat_era5_yearly_zarr.py \
-    ~/data/era5_zarr_16x16_12month ~/data/era5_1940_2024_16x16_18month.zarr   # -> one zarr for the whole record
-python 2_retrospective/3_route_by_region.py --dry-run           # what each region costs, and its k/x stability
-python 2_retrospective/3_route_by_region.py                     # by region, writing one store per calendar year
-python 2_retrospective/3_route_by_year.py                       # by year: every region for a year, then its columns
-python 2_retrospective/3_route_regions.py --processes 4 --threads 8   # stock river-route: a zarr per region per year
-python 2_retrospective/3_reduce_hourly.py                        # those zarrs -> daily, monthly, yearly, maximums
-python 2_retrospective/3_concatenate.py --s3-url s3://<bucket>/<prefix>  # or -> every whole-record store, uploaded
+2_retrospective/simulate.sh                               # every step below in order, settings from config.sh
+python 2_retrospective/1_route_regions.py --first-year 1995 --last-year 2024 --warm-up 2 --processes 14 --threads 2
+python 2_retrospective/2_concatenate.py --processes 7 --threads 4    # add --s3-url s3://<bucket>/<prefix> to upload
+python 2_retrospective/3_return_periods.py --processes 20             # maximums.zarr -> return-periods.zarr
 ```
 
-Step 3 has three versions. `3_route_by_year.py` writes the whole-record stores directly; `3_route_by_region.py` writes
-one store per calendar year, to be merged along time afterwards; `2_route_regions.py` writes river-route's own output,
-one zarr per region per year, and none of the published stores.
+On the 32-core M3 Ultra, the 30 years 1995-2024 for all 4.9 million rivers routed in 25 minutes, concatenated in 30
+and fit return periods in 7. The routed discharge is 1.5 TB, and the stores 1.75 TB, almost all of it `hourly`.
 
-### 3_route_by_year.py
+### 1_route_regions.py
 
-For each year, every region routes concurrently. Each region starts from its channel state at the end of the previous
-year and writes its rivers into its rows of a single global (river, hour) buffer in shared memory. That buffer is the
-concatenation of all regions. The script then rounds the year, reduces it to daily, monthly, yearly and maximum
-values, and writes that year's columns of every store. Nothing is held on disk except the channel states.
+The example in `river-route/examples/example_usage.py`, run for every region. Each region routes the years
+`--first-year` to `--last-year` in order, one Router per year, each year starting from the channel state the last one
+ended with. A year's runoff is every zarr in `--runoff-root/year=<yyyy>/`, by default the four 3-month zarrs of
+`~/data/era5_zarr_16x16_3month`, routed in order by the year's Router and written as one store for the whole year:
+`--discharge-root/region=<id>/discharge_era5_<yyyy>01_<yyyy>12.zarr`, through river-route's zarr writer compressing
+with `rfs_spec.COMPRESSOR` and rounding to `rfs_spec.KEEP_BITS`. The state the year ended with is saved beside it as
+`channel_state_era5_<yyyy>01_<yyyy>12.parquet`. The network and weight table are read once per region and reused by
+every year.
 
-The global buffer is 173 GB for a leap year, plus whatever the routers hold while they run. Each year's write updates
-part of every shard, because a shard spans the whole time axis, so zarr reads and rewrites each shard once per year.
-A rerun resumes after the last year recorded in `--out-dir/last_year`.
+Each region is warmed up first: its first `--warm-up` years, 2 by default, are routed from empty channels, their
+discharge discarded, and the state they end with saved as `channel_state_warm_up.parquet`. The record then starts at
+`--first-year` from that state, so it needs no runoff before the record and can start with ERA5 in 1940. `--processes` regions route at once, biggest first, each on `--threads`
+threads; their product may not exceed the machine's cores. A year's state is written only after its discharge, so a
+rerun resumes each region after its last saved year and skips a region that has `--last-year`'s.
 
-### 3_route_regions.py
+### 2_concatenate.py
 
-The example in `river-route/examples/example_usage.py`, run for every region. Each region routes the 85 yearly runoff
-zarrs from step 2 in order, one Router per year, each year starting from the channel state the last one ended with.
-River-route's zarr writer, compressing with `rfs_spec.COMPRESSOR` in place of its lz4, saves each year as
-`--discharge-root/region=<id>/discharge_era5_<yyyy>01_<yyyy>12.zarr`, and the state it ended with is saved beside it
-as `channel_state_era5_<yyyy>01_<yyyy>12.parquet`. The network and weight table are read once per region and reused
-by every year. The run ends by printing its total time.
-
-`--processes` regions route at once, biggest first, each on `--threads` threads; their product may not exceed the
-machine's cores. A year's state is written only after its discharge, so a rerun resumes each region after its last
-saved year and skips a region that has 2024's.
-
-### 3_reduce_hourly.py
-
-Reduces the per-region yearly zarrs from `2_route_regions.py` to the published `daily`, `monthly`, `yearly` and
-`maximums` stores, one per calendar year at `rfs_spec.store_path`: `daily/daily_1980.zarr` and so on. The values are
-`rfs_spec.reduce_year`'s: daily, monthly and yearly means of the hourly values, and the annual maxima of the hourly values
-and of the daily means. ERA5 starts at 1940-01-01 07:00, so the first day, month and year of 1940 are means of the
-hours present. It does not write `hourly`.
-
-The work is one region's year at a time, `--processes` at once. A year is reduced only once its channel state is
-saved, so this can run behind routing. Each finished region year is marked in `--out-dir/.progress` and skipped by a
-rerun, and when a year has every region, `Q_timesteps` is filled for monthly and yearly.
-
-### 3_concatenate.py
-
-The fast version of `3_reduce_hourly.py`. It writes all five published stores over the whole record, `hourly.zarr` as
-well, one river's record per chunk and 250 rivers per shard, and uploads them to S3 as they are written. Its
-`daily`, `monthly`, `yearly` and `maximums` are bit identical to `3_reduce_hourly.py`'s years concatenated along time.
+Reduces the per-region yearly zarrs from `1_route_regions.py` in one pass. It writes all five published stores over
+the whole record, `hourly.zarr` as well, in each array's chunks and shards from `rfs_spec.LAYOUT`, and uploads them to
+S3 as they are written. Its `daily`, `monthly`, `yearly` and `maximums` are reduced from the hourly values in the same
+pass that writes them.
 
 The 15 TB of hourly record is read once and written once. Each process streams a segment of rivers in `riverIndex`
 order: it decodes the next 500-river input chunk of all 85 years into a 2.2 GB buffer, writes every shard that
-buffer completes, and carries the leftover rivers to the next chunk. No shard is written twice or read back, and the
-only input read twice is the chunk under each cut between segments, under 1% with the defaults. `Q_timesteps` is written at the end from
-22 GB of monthly and yearly values kept in `--work-dir`, not by reading the stores back.
+buffer completes, and carries the leftover rivers to the next chunk. hourly and daily shards are written as the
+segment streams; segments are cut on daily's 1,000-river shards. No shard is written twice or read back, and the only
+input read twice is the chunk under each cut between segments, under 1% with the defaults. monthly, yearly and
+maximums, whose shards are thousands of rivers, and `Q_timesteps` are written at the end from 25 GB of their values
+kept in `--work-dir`, not by reading the stores back.
 
 Whole shards are encoded with blosc and written directly, without zarr. zarr spends about 350 µs on every chunk,
 which is 40 times the encoding of a yearly chunk. Each process first checks on a test shard that its bytes match
@@ -164,40 +147,16 @@ Real discharge is smoother and compresses better. At that size the upload decide
 1 Gbit/s, and about 1.3 hours at 10 Gbit/s.
 
 A rerun resumes. Each segment records the rivers it has written, after their shards, and continues from there.
-Routing must be finished: every region needs every year. `--overwrite` deletes the stores and `--work-dir`.
+Routing must be finished: every region needs every year. To build the stores again, delete them and `--work-dir`.
 
-### 3_route_by_region.py
+### 3_return_periods.py
 
-Routes from the one concatenated ERA5 zarr, in windows of whole calendar years, and writes each year into its own
-store: `hourly/hourly_1980.zarr`, `daily/daily_1980.zarr` and the same for monthly, yearly and maximums. Each store
-holds every river in `riverIndex` order, so a year is whole in the river dimension as soon as its regions are
-written. Merging a store's years along time is a concatenation of whole chunks and can happen at upload.
-
-Nothing is held between years: no hourly record, no reductions, no working disk beyond the channel states. A region
-costs one window, `n_rivers * window_hours * 4` bytes, which is 10.6 GB per year for the largest. Regions therefore
-do not take turns — they start biggest first and as many run at once as `--memory-gb` and `--jobs` allow, each
-admitted when its window fits in what is left, so the small regions fill in around the large ones.
-
-A window is read out of the concatenated store by the chunk tiles the region's weight table touches: exactly the
-chunks zarr has to decompress, at most 60 for any region, rather than a bounding box that is nearly the whole globe
-for the four regions that straddle the prime meridian, where ERA5's 0..360 longitudes wrap.
-
-Each region's rivers are one contiguous run of `riverIndex`, so each region writes its own rows directly. Only the
-first and last 250-river shard of a region can hold a neighbor's rivers, so only writes to those two shards take a
-file lock.
-
-Writing costs about 80 µs per chunk whatever the chunk holds, and a chunk is one river's year, so the four reduced
-stores together cost as much to write as `hourly` while holding 4% of the data. Writing all 42 years of all five
-stores is roughly 30 core-hours.
-
-`--dry-run` prints each region's memory, the chunks it reads, and how its `k` and `x` fare at `--dt-routing`, and
-routes nothing. `--dt-routing`, `--network-conditioning`, `--k-scale` and `--x` change the routing parameters in
-memory without rewriting `routing.parquet`.
-
-A rerun resumes. A year's rows are written to every store before its window's channel state is saved, so a state
-file means every year up to it is complete; a region continues after its last saved year and a finished region is
-skipped. `--overwrite` starts over. Once every region is written, the last run fills `Q_timesteps` and consolidates
-every year of every store.
+Fits Gumbel, log-Pearson III, lognormal and Weibull, each by moments, to both annual maximum series of
+`maximums.zarr`, the hourly maxima and the maxima of the daily means, and writes `return-periods.zarr` beside it: each
+fit's flow at the recurrence intervals 1.5, 2, 5, 10, 25, 50 and 100 years, `max_simulated_hourly` and
+`max_simulated_daily`, and the `recurrence_interval` and `annual_exceedance_probability` coordinates. The log fits
+read maxima below 1e-4 m3/s as 1e-4, and a river whose maxima are all equal gets that value at every interval. Each
+process fits and writes one 250,000-river shard, 20 for the world.
 
 ## 4_forecasts
 
@@ -205,13 +164,14 @@ Builds the 15 day forecast's `discharge.zarr` from the 51 IFS ensemble GRIB file
 the whole world at once with `global/` of `1_prepare_inputs`, on the `O1280` weights.
 
 ```bash
+4_forecasts/simulate.sh                                                # every step below in order, settings from config.sh
 python 4_forecasts/1_route_forecast.py --init-state <state.parquet>   # every member -> forecasts-work/<YYYYMMDDHH>/
 python 4_forecasts/2_discharge_zarr.py                                # -> forecasts15/year=YYYY/month=MM/day=DD/discharge.zarr
 python 4_forecasts/3_summary_files.py --initialization 2026-09-27T00  # -> maps/*/styles.{json,bin} and alerts.csv
 ```
 
 The first two default to the newest initialization they find: in `~/data/rfsv3/forcings/ifs`, named
-`ro_<YYYYMMDD>_<HH>z_<cf|pfN>.grib`, and in the work directory.
+`<cf_00|pf_01..pf_50>_<YYYYMMDD>.grib` (00 UTC runs), and in the work directory.
 
 ### 1_route_forecast.py
 
@@ -237,7 +197,7 @@ initialization, `lead_time` on the time dimension, and `percentiles` 0..100 by 1
 over the whole horizon. So the members are read back a block of whole shards at a time, stacked, reduced and written by
 `--jobs` processes. With 51 members every decile is a member's value, so the percentiles need no rounding, and the mean
 is rounded to 13 keepbits. The 27 September 2026 forecast, 4.9 million rivers, took 4.5 min with 32 processes and is 61
-GB. The member files are always deleted once the store is in place.
+GB. The member files are kept, about 120 GB a forecast, for you to remove once the store is published.
 
 Members are numbered as ECMWF numbers them: the control forecast is 0 and the perturbed forecasts are 1..50. The
 `member` coordinate says so in its `description`.

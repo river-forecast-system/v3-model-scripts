@@ -20,8 +20,9 @@ routed into river i. spec.global_layout also finds a region's rows of the publis
 The routing table is the region's metadata renamed: riverId, nextRiverId, musk_k and musk_x become river_id,
 next_river_id, k and x. Nothing is recomputed. Changing k or x is an option of the routing step.
 
-Regions are independent and run in parallel, biggest first. A region whose routing.parquet exists is skipped unless
---overwrite is passed. The global table is written once every region has one, and rewritten when any region was.
+Regions are independent and run in parallel, biggest first. A region whose routing.parquet exists is skipped, as
+is a global table that exists; a file is only rebuilt once you delete it. The global table is written once every
+region has one.
 Each file is written to a temporary name and renamed into place, so an interrupted run never leaves a file that looks
 finished.
 """
@@ -82,13 +83,11 @@ if __name__ == '__main__':
                         help='where the routing files are written, a region=<id> folder per region')
     parser.add_argument('--regions', nargs='+', help='prepare only these regions')
     parser.add_argument('--jobs', type=int, default=None, help='regions prepared at once, default every core')
-    parser.add_argument('--overwrite', action='store_true',
-                        help='rewrite regions whose routing.parquet exists, and the global one')
     args = parser.parse_args()
 
     regions = list_regions(args.hydrography, args.regions)
-    todo = [r for r in regions if args.overwrite or not (args.routing / f'region={r}' / 'routing.parquet').exists()]
+    todo = [r for r in regions if not (args.routing / f'region={r}' / 'routing.parquet').exists()]
     print(f'{len(regions) - len(todo)} of {len(regions)} regions already have routing.parquet', flush=True)
     prepare_all(prepare_region, [{'region': r, 'hydrography': args.hydrography, 'routing': args.routing} for r in todo],
                 args.jobs, 'write routing.parquet for')
-    write_global(args.hydrography, args.routing, 'routing.parquet', args.overwrite or bool(todo))
+    write_global(args.hydrography, args.routing, 'routing.parquet')

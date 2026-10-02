@@ -5,15 +5,17 @@ specification defines, laid out as rfs_spec.create_forecast_store says:
     <out-root>/year=YYYY/month=MM/day=DD/discharge.zarr    uploaded as is to s3://river-forecast-system-v3/forecasts15/
 
     Q               (riverId, member, time)         every member, chunks (1, 51, 120) in shards of (250, 51, 120)
-    Qpercentiles    (riverId, percentiles, time)    the ensemble's deciles, 0 the minimum and 100 the maximum
-    Qmean           (riverId, time)                 the ensemble mean, which is not the median, Qpercentiles at 50
+    Qpercentiles    (riverId, percentiles, time)    the ensemble's deciles, 0 the minimum and 100 the maximum,
+                                                    chunks (1, 11, 120) in shards of (1000, 11, 120)
+    Qmean           (riverId, time)                 the ensemble mean, which is not the median, Qpercentiles at 50,
+                                                    chunks (250, 120) in shards of (10000, 120)
 
 The members are opened together with xarray.open_mfdataset, concatenated along member, and their labels checked
 before anything is written: every member of rfs_spec.MEMBERS once, the riverId axis of hydrography/global/
 metadata.parquet in riverIndex order, the order of every published store, and the time axis of
 rfs_spec.forecast_times.
 
-Each chunk is one river's whole ensemble over the whole horizon, so the store is written a block of rivers at a time:
+Each chunk holds whole ensembles over the whole horizon, so the store is written a block of rivers at a time:
 each block of every member is read, stacked into (river, member, time), reduced, and written as whole shards. Blocks
 are a whole number of shards, so no two processes write one shard, and --jobs of them run at once.
 
@@ -21,13 +23,13 @@ The members are already rounded to 13 keepbits. Every decile of 51 members falls
 members' values, and the mean is rounded onto the same grid, as rfs_spec.ensemble_summaries explains.
 
 The store is written to a temporary name and renamed into place when it is complete, so an interrupted run never
-leaves a store that looks finished. An existing store is kept unless --overwrite is passed. The member files are
-always deleted once the store is in place.
+leaves a store that looks finished, and its rerun starts the temporary store over. A store that exists is kept, and
+nothing is ever deleted: the member files stay in --work-dir, about 120 GB a forecast, for you to remove once the
+store is published.
 """
 
 import argparse
 import os
-import shutil
 import time
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
@@ -111,22 +113,25 @@ if __name__ == '__main__':
     parser.add_argument('--out-root', type=Path, default=Path.home() / 'data' / 'rfsv3' / 'forecasts15',
                         help='the forecasts15/ tree the store is written into')
     parser.add_argument('--jobs', type=int, default=os.cpu_count() or 8, help='processes writing blocks at once')
-    parser.add_argument('--shards-per-block', type=int, default=20, help='250 river shards each process writes at once')
-    parser.add_argument('--overwrite', action='store_true', help='rewrite an existing store')
+    parser.add_argument('--block', type=int, default=rfs_spec.FORECAST_BLOCK,
+                        help='rivers each process writes at once, a multiple of rfs_spec.FORECAST_BLOCK')
     args = parser.parse_args()
 
     began = time.time()
     initialization = args.initialization or latest_initialization(args.work_dir)
+    path = rfs_spec.forecast_store_path(args.out_root, initialization)
+    if path.exists():  # finished by an earlier run, so a rerun of every step passes over it
+        print(f'{path} exists and is kept; delete it to write it again', flush=True)
+        raise SystemExit(0)
     member_dir = args.work_dir / f'{initialization:%Y%m%d%H}'
     files = tuple(member_dir / f'member_{m:02d}.nc' for m in rfs_spec.MEMBERS)
     if missing := [f.name for f in files if not f.exists()]:
         raise SystemExit(f'{len(missing)} members are not routed in {member_dir}, e.g. {missing[0]}')
-    path = rfs_spec.forecast_store_path(args.out_root, initialization)
-    if path.exists() and not args.overwrite:
-        raise SystemExit(f'{path} exists; pass --overwrite to rewrite it')
 
     river_ids = river_axis(args.hydrography)
-    block = rfs_spec.RIVERS_PER_SHARD * args.shards_per_block
+    block = args.block
+    if block < 1 or block % rfs_spec.FORECAST_BLOCK:
+        raise SystemExit(f'--block {block} must be a multiple of {rfs_spec.FORECAST_BLOCK}, whole shards of each array')
     with open_members(list(files), block) as members:
         check_labels(members, river_ids, initialization)
 
@@ -143,9 +148,6 @@ if __name__ == '__main__':
             if n % 100 == 0 or n == len(jobs):
                 print(f'[{n}/{len(jobs)}] {written:,} rivers, {(time.time() - began) / 60:.1f} min', flush=True)
 
-    if path.exists():
-        shutil.rmtree(path)
     os.replace(partial, path)
-    print(f'{path} written in {(time.time() - began) / 60:.1f} min', flush=True)
-    shutil.rmtree(member_dir)
-    print(f'deleted the member files in {member_dir}', flush=True)
+    print(f'{path} written in {(time.time() - began) / 60:.1f} min. The member files in {member_dir} are kept',
+          flush=True)
