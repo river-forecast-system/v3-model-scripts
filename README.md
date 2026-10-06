@@ -7,6 +7,7 @@ Scripts that build the RFS v3 products, one folder each:
 3. `3_reforecasts/`: the reforecasts
 4. `4_forecasts/`: the 15 day forecasts
 5. `5_extended_forecasts/`: the extended range forecasts
+6. `6_flood_maps/`: the return period flood maps and FLDPLN libraries
 
 Needs Python 3.14 and a local checkout of [river-route](../river-route) beside this one. `uv sync` installs both,
 and this project, so every folder imports `rfs_spec`.
@@ -213,3 +214,14 @@ The formats are documented in the specification's "Forecast map stylesets" and "
 
 Not built yet: `maps/esri_animation_tables/`, whose format the specification does not give, `fim.geo.parquet`, and the
 warm states, whose partition the specification has not settled.
+
+
+## 6_flood_maps
+Builds the return period flood maps and FLDPLN libraries. This step is designed to run in an HPC environment, in an environment where condaforge, miniforge, mambaforge, or conda with conda-forge as the default channel is installed. Outputs are automatically copied from the HPC's volatile scratch space to a more permanent storage location. The script `compute.sh` is run by `run.sh`, one SLURM task per DEM tile. We have determiend from testing, that it is best to run one 1x1 degree tile at a time, and allot each tile 1 CPU core with at least 30 GB of RAM and 35 minutes of wall time, although most tiles will finish in less than 10 minutes and only require ~8 GB of RAM. Currently, the script is set up to run only on tiles that cover the bounding box of the continental United States, but it can be modified to run on any DEM tile.
+
+```bash
+./6_flood_maps/run.sh
+```
+
+### 1_make_floodmap_products.py
+Contains the NenCarta entrypoint for building the flood maps and FLDPLN libraries. The script reads a DEM tile, land cover, and streamlines, and produces a flood map for the specified return periods. It also contains the specific settings for the NenCarta run; it is recommended to consult the documentation for NenCarta [here](https://nencarta.readthedocs.io/en/latest/index.html).

@@ -56,3 +56,27 @@ export FORECAST_WORK_DIR=${FORECAST_WORK_DIR:-$DATA_ROOT/forecasts-work}
 export FORECASTS=${FORECASTS:-$DATA_ROOT/forecasts15}
 export FORECAST_THREADS=${FORECAST_THREADS:-$CORES}  # every member routes in one Router on these threads
 export FORECAST_JOBS=${FORECAST_JOBS:-$CORES}  # processes writing and summarizing blocks of rivers at once
+
+# ----------------------------------------------------------------------------------------------------------------------
+# Flood maps, 6_flood_maps/run.sh
+# ----------------------------------------------------------------------------------------------------------------------
+export NOBACKUP_DIR=${NOBACKUP_DIR:-/nobackup/autodelete/usr/lrr43}
+export DATA_DIR=${DATA_DIR:-$NOBACKUP_DIR/data}
+export NENCARTA_CACHE_DIR=${NENCARTA_CACHE_DIR:-$NOBACKUP_DIR/}
+
+# ----------------------------------------------------------------------------------------------------------------------
+# Inputs
+# ----------------------------------------------------------------------------------------------------------------------
+export DEM_DIR=${DEM_DIR:-$DATA_DIR/fabdem}  # <10x10 degree dir>/<tile>.tif
+export STREAMLINES_DIR=${STREAMLINES_DIR:-$DATA_DIR/streamlines_v3}  # *.parquet
+export LANDCOVER_DIR=${LANDCOVER_DIR:-$DATA_DIR/landcover}  # *.tif
+export LAKES=${LAKES:-$DATA_DIR/all_lakes_filtered_simple.parquet}
+export N_FILE=${N_FILE:-$DATA_DIR/n_file.tsv}
+export RETURN_PERIOD_FILE=${RETURN_PERIOD_FILE:-$DATA_DIR/return_periods_lp3_era5_north_america_1940_2024.nc}
+
+# ----------------------------------------------------------------------------------------------------------------------
+# Outputs
+# ----------------------------------------------------------------------------------------------------------------------
+export OUTPUT_DIR=${OUTPUT_DIR:-$NOBACKUP_DIR/usa}  # nencarta writes each tile here, lon_<lon>/lat_<lat>
+# each finished tile is copied here, lon=<lon>/lat=<lat>; empty copies nothing
+export COPY_DIR=${COPY_DIR-/home/lrr43/usa}

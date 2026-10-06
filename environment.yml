@@ -1,0 +1,30 @@
+name: flood
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - botocore
+  - gdal
+  - geopandas
+  - intel-cmplr-lib-rt
+  - libgdal-arrow-parquet
+  - networkx
+  - numexpr
+  - pip
+  - polars
+  - pyarrow
+  - python
+  - pyyaml
+  - requests
+  - rich
+  - s3fs
+  - scipy
+  - shapely
+  - tqdm
+  - whitebox
+  - xarray
+  - zarr
+  - pip:
+      - git+https://github.com/MikeFHS/automated-rating-curve.git
+      - git+https://github.com/MikeFHS/curve2flood.git
+      - git+https://github.com/jlgutenson/nencarta.git
